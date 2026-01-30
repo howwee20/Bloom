@@ -1,0 +1,69 @@
+[
+  {
+    "name": "bloom_create_agent",
+    "description": "Create a new agent for the authenticated user.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "user_id": { "type": "string" }
+      },
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_can_do",
+    "description": "Request a quote to see if an intent is allowed.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "intent_json": { "type": "object" },
+        "idempotency_key": { "type": "string" },
+        "user_id": { "type": "string" }
+      },
+      "required": ["agent_id", "intent_json"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_execute",
+    "description": "Execute a previously approved quote.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "quote_id": { "type": "string" },
+        "idempotency_key": { "type": "string" },
+        "step_up_token": { "type": "string" },
+        "override_freshness": { "type": "boolean" }
+      },
+      "required": ["quote_id", "idempotency_key"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_get_state",
+    "description": "Fetch the latest state and observation for an agent.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" }
+      },
+      "required": ["agent_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_get_receipts",
+    "description": "Fetch receipts for an agent.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "since": { "type": "number" }
+      },
+      "required": ["agent_id"],
+      "additionalProperties": false
+    }
+  }
+]
