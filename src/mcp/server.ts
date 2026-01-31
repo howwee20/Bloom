@@ -107,6 +107,9 @@ async function bloomCanDo(agentId: string, intentJson: Record<string, unknown>, 
 async function main() {
   await verifyKeys();
 
+  // Log to stderr so we don't interfere with MCP stdio protocol
+  console.error(`Bloom MCP ready | ${baseUrl}`);
+
   const server = new Server(
     { name: "bloom-mcp", version: "0.1.0" },
     { capabilities: { tools: {} } }

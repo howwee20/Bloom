@@ -52,7 +52,77 @@ Not in contract
 - Provider-specific payload shapes (e.g., Base USDC receipts or card metadata beyond declared fields).
 - Internal DB schemas, migrations, or log formatting.
 
-## Quickstart
+## Docker Quickstart (Recommended)
+
+The one true way to run the kernel. Works on any machine with Docker Desktop.
+
+### Prerequisites
+
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) installed and running
+
+### Run the Kernel
+
+```bash
+git clone https://github.com/howwee20/BloomAI.git
+cd BloomAI
+cp .env.example .env
+docker compose up -d --build
+```
+
+### Verify Healthy
+
+Wait ~30 seconds for first build, then:
+
+```bash
+curl http://localhost:3000/healthz
+```
+
+Expected output:
+```json
+{
+  "api_version": "0.1.0-alpha",
+  "db_connected": true,
+  "migrations_applied": true,
+  "card_mode": "dev",
+  "env_type": "base_usdc",
+  "git_sha": "..."
+}
+```
+
+**What "healthy" means:**
+- `db_connected: true` - SQLite database is accessible
+- `migrations_applied: true` - Schema is up to date
+- API is listening on `0.0.0.0:3000`
+
+### Ports and Persistence
+
+| Port | Service |
+|------|---------|
+| 3000 | Kernel API |
+| 3001 | Approval UI (if `BIND_APPROVAL_UI=true`) |
+
+Data persists in Docker volume `bloom_data`. Database path inside container: `/data/kernel.db`.
+
+### Shut Down and Wipe Data
+
+```bash
+docker compose down           # Stop containers (data persists)
+docker compose down --volumes # Stop and DELETE all data
+```
+
+### Smoke Test
+
+Run the full end-to-end test:
+
+```bash
+./scripts/docker_smoke.sh
+```
+
+Expected final output: `=== SMOKE TEST PASSED ===`
+
+## Local Development Quickstart
+
+For development without Docker:
 
 ```bash
 pnpm install
@@ -167,47 +237,128 @@ curl -s -X POST http://localhost:3000/api/card/auth \
   -d '{"auth_id":"auth_1","card_id":"card_1","agent_id":"AGENT_ID","merchant":"Test","mcc":"5812","amount_cents":500,"currency":"USD","timestamp":1700000000}'
 ```
 
-## MCP server (read/propose only)
+## Claude Desktop MCP Quickstart
 
-Run the MCP server locally:
-```bash
-export BLOOM_BASE_URL=http://localhost:3000
-export BLOOM_READ_KEY=READ_API_KEY
-export BLOOM_PROPOSE_KEY=PROPOSE_API_KEY
-pnpm mcp
-```
-The MCP server fails closed if either key includes execute/owner scopes or is missing its required scope.
+The MCP server enables Claude Desktop to read agent state and propose actions. By design, **Claude cannot execute transactions** - humans approve out-of-band.
 
-Create scoped keys with the admin endpoint:
+### Available MCP Tools
+
+| Tool | Description | Scope Required |
+|------|-------------|----------------|
+| `bloom_get_state` | Fetch agent state and observation | read |
+| `bloom_list_receipts` | List receipts for an agent | read |
+| `bloom_can_do` | Request a quote (propose only) | propose |
+
+No `execute` tool is exposed. This is intentional.
+
+### Step 1: Create Scoped API Keys
+
+The MCP server requires two separate keys with minimal scopes:
+
 ```bash
+# Create read-only key
 curl -s -X POST http://localhost:3000/api/admin/keys \
   -H 'content-type: application/json' \
   -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
-  -d '{"user_id":"user_1","scopes":["read"]}'
+  -d '{"user_id":"mcp_user","scopes":["read"]}'
+
+# Create propose-only key
+curl -s -X POST http://localhost:3000/api/admin/keys \
+  -H 'content-type: application/json' \
+  -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
+  -d '{"user_id":"mcp_user","scopes":["propose"]}'
 ```
 
-Claude Desktop config snippet:
+Save both `api_key` values from the responses.
+
+### Step 2: Configure Claude Desktop
+
+Edit your Claude Desktop config file:
+
+**macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+
 ```json
 {
   "mcpServers": {
     "bloom": {
       "command": "pnpm",
       "args": ["mcp"],
+      "cwd": "/path/to/BloomAI",
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
-        "BLOOM_READ_KEY": "READ_API_KEY",
-        "BLOOM_PROPOSE_KEY": "PROPOSE_API_KEY"
+        "BLOOM_READ_KEY": "your_read_only_api_key",
+        "BLOOM_PROPOSE_KEY": "your_propose_only_api_key"
       }
     }
   }
 }
 ```
 
-Smoke test:
+Replace `/path/to/BloomAI` with your actual repo path.
+
+### Step 3: Restart Claude Desktop
+
+Quit and reopen Claude Desktop. The MCP server logs to stderr:
+```
+Bloom MCP ready | http://localhost:3000
+```
+
+### First 3 Prompts to Try
+
+Once configured, ask Claude:
+
+1. **"Show spend summary for agent_ej"**
+   - Uses `bloom_get_state` to fetch current observation and spend power
+
+2. **"List last 10 receipts for agent_ej"**
+   - Uses `bloom_list_receipts` to show transaction history
+
+3. **"Can agent_ej send $1.00 to 0x1111111111111111111111111111111111111111?"**
+   - Uses `bloom_can_do` to check if transfer is allowed
+   - Returns a quote with `allowed: true/false`
+   - Does NOT execute - human approval required out-of-band
+
+### MCP Smoke Test
+
+Verify MCP is working (requires kernel running and scoped keys in `.env`):
+
 ```bash
-export BLOOM_AGENT_ID=AGENT_ID
+export BLOOM_AGENT_ID=your_agent_id
 pnpm mcp:smoke
 ```
+
+Expected output: JSON with agent state.
+
+### Troubleshooting
+
+**MCP not connecting**
+- Ensure Claude Desktop is fully quit and restarted after config changes
+- Check that `cwd` path exists and contains `package.json`
+
+**"BLOOM_BASE_URL_required" or similar**
+- All three env vars are required: `BLOOM_BASE_URL`, `BLOOM_READ_KEY`, `BLOOM_PROPOSE_KEY`
+- Check for typos in the config file
+
+**"READ_KEY_scope_too_permissive"**
+- The read key must have ONLY `["read"]` scope
+- Keys with `propose`, `execute`, `owner`, or `*` are rejected
+- Create a new key with minimal scope
+
+**"PROPOSE_KEY_scope_too_permissive"**
+- The propose key must have ONLY `["propose"]` scope (or `["read", "propose"]`)
+- Keys with `execute`, `owner`, or `*` are rejected
+
+**Server not running / connection refused**
+- Ensure kernel is running: `curl http://localhost:3000/healthz`
+- If using Docker: `docker compose up -d`
+
+**Wrong port**
+- Default is 3000. If you changed `PORT` in `.env`, update `BLOOM_BASE_URL` to match
+
+**MCP tools not appearing in Claude**
+- Open Claude Desktop settings and verify "bloom" server is listed
+- Check Claude Desktop logs for MCP errors
+- Try running `pnpm mcp` directly to see startup errors
 
 ## Replay verifier
 

@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   api:
     build: .
@@ -9,6 +7,12 @@ services:
     volumes:
       - bloom_data:/data
     command: ["sh", "-c", "pnpm migrate && pnpm start"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   worker:
     build: .
@@ -16,6 +20,9 @@ services:
     volumes:
       - bloom_data:/data
     command: ["sh", "-c", "pnpm migrate && pnpm worker:base_usdc"]
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   bloom_data:
