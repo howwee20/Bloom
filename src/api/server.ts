@@ -3,17 +3,35 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import fs from "node:fs";
 import path from "node:path";
 import { createHash, randomBytes } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { createDatabase } from "../db/database.js";
 import { getConfig } from "../config.js";
 import { Kernel } from "../kernel/kernel.js";
 import { SimpleEconomyWorld } from "../env/simple_economy.js";
 import { BaseUsdcWorld } from "../env/base_usdc.js";
-import { agentTokens, agents, apiKeys, budgets, quotes, users } from "../db/schema.js";
-import { eq } from "drizzle-orm";
+import {
+  agentSpendSnapshot,
+  agentTokens,
+  agents,
+  apiKeys,
+  budgets,
+  cardHolds,
+  events,
+  policies,
+  quotes,
+  receipts,
+  stepUpChallenges,
+  users
+} from "../db/schema.js";
+import { and, desc, eq } from "drizzle-orm";
 import type { DbClient } from "../db/database.js";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import type { IEnvironment } from "../env/IEnvironment.js";
 import { newId, nowSeconds } from "../kernel/utils.js";
+import { appendEvent } from "../kernel/events.js";
+import { createReceipt } from "../kernel/receipts.js";
+import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
+import { CARD_SIGNATURE_HEADER, CARD_TIMESTAMP_HEADER, verifyCardSignature } from "./card_webhook.js";
 
 type AuthUser = {
   userId: string;
@@ -57,6 +75,77 @@ function parseScopes(value: unknown): string[] {
   return [];
 }
 
+function parseJson<T>(value: unknown, fallback: T): T {
+  if (value == null) return fallback;
+  if (typeof value === "string") {
+    try {
+      return JSON.parse(value) as T;
+    } catch {
+      return fallback;
+    }
+  }
+  return value as T;
+}
+
+function hasScope(scopes: string[] | undefined, required: "read" | "propose" | "execute" | "owner") {
+  if (!scopes || scopes.length === 0) return false;
+  if (scopes.includes("*") || scopes.includes("owner")) return true;
+  if (required === "owner") return scopes.includes("owner");
+  if (required === "execute") return scopes.includes("execute");
+  if (required === "propose") return scopes.includes("propose") || scopes.includes("execute");
+  if (required === "read") return scopes.includes("read") || scopes.includes("propose") || scopes.includes("execute");
+  return false;
+}
+
+function requireScope(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  required: "read" | "propose" | "execute" | "owner"
+) {
+  const authUser = request.authUser;
+  if (!authUser) {
+    reply.status(401).send({ error: "api_key_required" });
+    return false;
+  }
+  if (!hasScope(authUser.scopes, required)) {
+    reply.status(403).send({ error: "insufficient_scope" });
+    return false;
+  }
+  return true;
+}
+
+function parseWindowSeconds(value: string | undefined, fallbackSeconds: number) {
+  if (!value) return fallbackSeconds;
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(\d+)([smhd])$/i);
+  if (match) {
+    const amount = Number(match[1]);
+    const unit = match[2].toLowerCase();
+    const mult =
+      unit === "s"
+        ? 1
+        : unit === "m"
+          ? 60
+          : unit === "h"
+            ? 3600
+            : unit === "d"
+              ? 86400
+              : 1;
+    return amount * mult;
+  }
+  const numeric = Number(trimmed);
+  return Number.isFinite(numeric) ? numeric : fallbackSeconds;
+}
+
+type CardAuthResponse = {
+  approved: boolean;
+  shadow: boolean;
+  would_approve?: boolean;
+  would_decline_reason?: string | null;
+  auth_status?: string;
+  idempotent?: boolean;
+};
+
 function requireAdminKey(config: ReturnType<typeof getConfig>, request: FastifyRequest, reply: FastifyReply) {
   if (!config.ADMIN_API_KEY) {
     reply.status(403).send({ error: "admin_key_not_configured" });
@@ -79,6 +168,68 @@ function ensureAgentOwnership(db: DbClient, agentId: string, userId: string) {
     return { ok: false as const, statusCode: 403, error: "forbidden" };
   }
   return { ok: true as const };
+}
+
+function resolveGitSha() {
+  const envSha =
+    process.env.GIT_SHA ??
+    process.env.VERCEL_GIT_COMMIT_SHA ??
+    process.env.GITHUB_SHA ??
+    process.env.SOURCE_VERSION ??
+    null;
+  if (envSha) return envSha;
+  try {
+    const headPath = path.resolve(".git", "HEAD");
+    if (!fs.existsSync(headPath)) return null;
+    const head = fs.readFileSync(headPath, "utf8").trim();
+    if (!head) return null;
+    if (!head.startsWith("ref:")) return head;
+    const ref = head.replace(/^ref:\s*/, "");
+    const refPath = path.resolve(".git", ref);
+    if (fs.existsSync(refPath)) {
+      return fs.readFileSync(refPath, "utf8").trim();
+    }
+    const packedPath = path.resolve(".git", "packed-refs");
+    if (fs.existsSync(packedPath)) {
+      const packed = fs.readFileSync(packedPath, "utf8");
+      const match = packed
+        .split("\n")
+        .find((line) => line && !line.startsWith("#") && line.endsWith(` ${ref}`));
+      if (match) return match.split(" ")[0] ?? null;
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+function findMigrationsDir() {
+  const candidates = [
+    path.resolve("src/db/migrations"),
+    path.resolve("dist/db/migrations"),
+    path.resolve("db/migrations")
+  ];
+  for (const dir of candidates) {
+    if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) return dir;
+  }
+  return null;
+}
+
+function migrationsApplied(sqlite: Database) {
+  try {
+    const table = sqlite
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'")
+      .get() as { name?: string } | undefined;
+    if (!table?.name) return false;
+    const appliedRows = sqlite.prepare("SELECT name FROM schema_migrations").all() as { name: string }[];
+    const applied = new Set(appliedRows.map((row) => row.name));
+    const migrationsDir = findMigrationsDir();
+    if (!migrationsDir) return applied.size > 0;
+    const files = fs.readdirSync(migrationsDir).filter((file) => file.endsWith(".sql")).sort();
+    return files.every((file) => applied.has(file));
+  } catch {
+    return false;
+  }
 }
 
 export function buildServer(options: {
@@ -108,6 +259,25 @@ export function buildServer(options: {
   const RATE_LIMIT_WINDOW_SECONDS = 60;
   const RATE_LIMIT_MAX_PER_KEY = 60;
   const RATE_LIMIT_MAX_PER_IP = 120;
+
+  app.get("/healthz", { config: { auth: "public" } }, async (_request, reply) => {
+    let dbConnected = false;
+    try {
+      sqlite.prepare("SELECT 1").get();
+      dbConnected = true;
+    } catch {
+      dbConnected = false;
+    }
+
+    return reply.send({
+      api_version: config.API_VERSION,
+      db_connected: dbConnected,
+      migrations_applied: migrationsApplied(sqlite),
+      card_mode: config.CARD_MODE,
+      env_type: config.ENV_TYPE,
+      git_sha: resolveGitSha()
+    });
+  });
 
   function consumeRate(key: string, max: number, now: number) {
     const existing = rateBuckets.get(key);
@@ -156,10 +326,20 @@ export function buildServer(options: {
     };
   });
 
-  app.post("/api/agents", async (request, reply) => {
-    const body = (request.body ?? {}) as { user_id?: string; agent_id?: string };
+  app.get("/api/health", { config: { auth: "public" } }, async (_request, reply) => {
+    return reply.send({ status: "ok", version: config.API_VERSION });
+  });
+
+  app.get("/api/whoami", async (request, reply) => {
     const authUser = request.authUser;
     if (!authUser) return reply.status(401).send({ error: "api_key_required" });
+    return reply.send({ user_id: authUser.userId, key_id: authUser.keyId, scopes: authUser.scopes });
+  });
+
+  app.post("/api/agents", async (request, reply) => {
+    const body = (request.body ?? {}) as { user_id?: string; agent_id?: string };
+    if (!requireScope(request, reply, "propose")) return;
+    const authUser = request.authUser as AuthUser;
     if (body.user_id && body.user_id !== authUser.userId) {
       return reply.status(403).send({ error: "forbidden" });
     }
@@ -174,8 +354,8 @@ export function buildServer(options: {
       intent_json: Record<string, unknown>;
       idempotency_key?: string;
     };
-    const authUser = request.authUser;
-    if (!authUser) return reply.status(401).send({ error: "api_key_required" });
+    if (!requireScope(request, reply, "propose")) return;
+    const authUser = request.authUser as AuthUser;
     if (body.user_id && body.user_id !== authUser.userId) {
       return reply.status(403).send({ error: "forbidden" });
     }
@@ -192,21 +372,51 @@ export function buildServer(options: {
       step_up_token?: string;
       override_freshness?: boolean;
     };
-    const authUser = request.authUser;
-    if (!authUser) return reply.status(401).send({ error: "api_key_required" });
+    if (!requireScope(request, reply, "execute")) return;
+    const authUser = request.authUser as AuthUser;
     const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
     if (quote && quote.userId !== authUser.userId) {
       return reply.status(403).send({ error: "forbidden" });
     }
-    const result = await kernel.execute(body);
+    const stepUpHeader = String(request.headers["x-step-up"] ?? "");
+    const stepUpToken = body.step_up_token ?? (stepUpHeader.length > 0 ? stepUpHeader : undefined);
+    const result = await kernel.execute({ ...body, step_up_token: stepUpToken });
     return reply.send(result);
+  });
+
+  app.post("/api/step_up/request", async (request, reply) => {
+    const body = request.body as { agent_id?: string; quote_id?: string };
+    if (!body.agent_id || !body.quote_id) return reply.status(400).send({ error: "agent_id_and_quote_id_required" });
+    if (!requireScope(request, reply, "owner")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, body.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== authUser.userId || quote.agentId !== body.agent_id) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    if (quote.requiresStepUp !== 1) {
+      return reply.status(400).send({ error: "step_up_not_required" });
+    }
+    const challenge = await kernel.requestStepUpChallenge({
+      user_id: authUser.userId,
+      agent_id: body.agent_id,
+      quote_id: body.quote_id
+    });
+    if (challenge.code) {
+      // eslint-disable-next-line no-console
+      console.log(`[step-up] challenge_id=${challenge.challenge_id} code=${challenge.code}`);
+    }
+    const approvalUrl = `http://127.0.0.1:${config.APPROVAL_UI_PORT}/approve/${challenge.challenge_id}`;
+    return reply.send({ challenge_id: challenge.challenge_id, approval_url: approvalUrl, expires_at: challenge.expires_at });
   });
 
   app.get("/api/state", async (request, reply) => {
     const query = request.query as { agent_id?: string };
     if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
-    const authUser = request.authUser;
-    if (!authUser) return reply.status(401).send({ error: "api_key_required" });
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
     const ownership = ensureAgentOwnership(db, query.agent_id, authUser.userId);
     if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
     const state = await kernel.getState(query.agent_id);
@@ -216,13 +426,495 @@ export function buildServer(options: {
   app.get("/api/receipts", async (request, reply) => {
     const query = request.query as { agent_id?: string; since?: string };
     if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
-    const authUser = request.authUser;
-    if (!authUser) return reply.status(401).send({ error: "api_key_required" });
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
     const ownership = ensureAgentOwnership(db, query.agent_id, authUser.userId);
     if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
     const since = query.since ? Number(query.since) : undefined;
     const rows = kernel.getReceipts(query.agent_id, since);
     return reply.send({ receipts: rows });
+  });
+
+  app.get("/api/agents/:agent_id/summary", async (request, reply) => {
+    const params = request.params as { agent_id: string };
+    const query = request.query as { window?: string };
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, params.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+    const windowSeconds = parseWindowSeconds(query.window, 7 * 24 * 3600);
+    const summary = kernel.getAgentSummary(params.agent_id, windowSeconds);
+    return reply.send(summary);
+  });
+
+  app.get("/api/agents/:agent_id/timeline", async (request, reply) => {
+    const params = request.params as { agent_id: string };
+    const query = request.query as { since?: string; limit?: string };
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, params.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+    const since = query.since ? Number(query.since) : undefined;
+    const limit = query.limit ? Number(query.limit) : undefined;
+    const timeline = kernel.getAgentTimeline(params.agent_id, since, limit);
+    return reply.send({ timeline });
+  });
+
+  app.get("/api/agents/:agent_id/receipt/:receipt_id", async (request, reply) => {
+    const params = request.params as { agent_id: string; receipt_id: string };
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, params.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+    const result = kernel.getReceiptWithFacts(params.agent_id, params.receipt_id);
+    if (!result) return reply.status(404).send({ error: "receipt_not_found" });
+    return reply.send(result);
+  });
+
+  app.post("/api/card/auth", { config: { auth: "public" } }, async (request, reply) => {
+    const body = request.body as {
+      auth_id?: string;
+      card_id?: string;
+      agent_id?: string;
+      merchant?: string;
+      mcc?: string;
+      amount_cents?: number;
+      currency?: string;
+      timestamp?: number;
+      metadata?: Record<string, unknown>;
+    };
+    const authId = String(body.auth_id ?? "");
+    const cardId = String(body.card_id ?? "");
+    const agentId = String(body.agent_id ?? cardId);
+    const amountCents = Number(body.amount_cents);
+    if (!authId || !agentId || !Number.isFinite(amountCents) || amountCents <= 0) {
+      return reply.status(400).send({ error: "invalid_request" });
+    }
+
+    const cardMode = config.CARD_MODE;
+    const signature = String(request.headers[CARD_SIGNATURE_HEADER] ?? "");
+    const timestamp = String(request.headers[CARD_TIMESTAMP_HEADER] ?? "");
+    let authStatus = "signed";
+
+    if (cardMode !== "dev") {
+      if (!config.CARD_WEBHOOK_SHARED_SECRET) {
+        return reply.send({ approved: false, shadow: cardMode === "shadow", auth_status: "unauthenticated" });
+      }
+      const verification = verifyCardSignature({
+        secret: config.CARD_WEBHOOK_SHARED_SECRET,
+        signature,
+        timestamp,
+        body,
+        now: nowSeconds()
+      });
+      if (!verification.ok) {
+        return reply.send({ approved: false, shadow: cardMode === "shadow", auth_status: "unauthenticated" });
+      }
+    } else {
+      if (!config.CARD_WEBHOOK_SHARED_SECRET || !signature || !timestamp) {
+        authStatus = "dev_unsigned";
+      } else {
+        const verification = verifyCardSignature({
+          secret: config.CARD_WEBHOOK_SHARED_SECRET,
+          signature,
+          timestamp,
+          body,
+          now: nowSeconds()
+        });
+        authStatus = verification.ok ? "signed" : "dev_unsigned";
+      }
+    }
+
+    const existingReceipt = db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.externalRef, authId))
+      .orderBy(desc(receipts.createdAt))
+      .get();
+    if (existingReceipt?.eventId) {
+      const event = db.select().from(events).where(eq(events.eventId, existingReceipt.eventId)).get();
+      const payload = event ? parseJson<Record<string, unknown>>(event.payloadJson, {}) : {};
+      const response = payload.response as CardAuthResponse | undefined;
+      if (response) {
+        return reply.send({ ...response, idempotent: true });
+      }
+    }
+
+    const agent = db.select().from(agents).where(eq(agents.agentId, agentId)).get();
+    if (!agent) {
+      const approved = cardMode !== "enforce";
+      const shadow = cardMode !== "enforce";
+      return reply.send({
+        approved,
+        shadow,
+        would_approve: false,
+        would_decline_reason: "agent_not_found",
+        auth_status: authStatus
+      });
+    }
+
+    const existingHold = db.select().from(cardHolds).where(eq(cardHolds.authId, authId)).get();
+    if (existingHold) {
+      return reply.send({
+        approved: cardMode === "enforce" ? existingHold.status !== "reversed" : true,
+        shadow: cardMode !== "enforce",
+        idempotent: true
+      });
+    }
+
+    let snapshot =
+      (db
+        .select()
+        .from(agentSpendSnapshot)
+        .where(eq(agentSpendSnapshot.agentId, agentId))
+        .get() as typeof agentSpendSnapshot.$inferSelect | undefined) ??
+      refreshAgentSpendSnapshot({ db, sqlite, config, agentId });
+
+    const policyRow = db
+      .select()
+      .from(policies)
+      .where(and(eq(policies.agentId, agentId), eq(policies.userId, agent.userId)))
+      .orderBy(desc(policies.createdAt))
+      .get() as typeof policies.$inferSelect | undefined;
+    const policy = policyRow
+      ? {
+          daily_limit: parseJson(policyRow.dailyLimitJson, {})
+        }
+      : { daily_limit: {} as { max_spend_cents?: number } };
+
+    const budget = db.select().from(budgets).where(eq(budgets.agentId, agentId)).get();
+    const dailyMax = policy.daily_limit.max_spend_cents ?? budget?.dailySpendCents ?? 0;
+    const dailyRemaining = Math.max(0, dailyMax - (budget?.dailySpendUsedCents ?? 0));
+
+    let wouldApprove = false;
+    let wouldDeclineReason: string | null = null;
+    if (!snapshot) {
+      wouldDeclineReason = "snapshot_missing";
+    } else if (amountCents > snapshot.policySpendableCents) {
+      wouldDeclineReason = "policy_limit_exceeded";
+    } else if (amountCents > snapshot.effectiveSpendPowerCents) {
+      wouldDeclineReason = "insufficient_spend_power";
+    } else {
+      wouldApprove = true;
+    }
+
+    const now = nowSeconds();
+    const approved = cardMode === "enforce" ? wouldApprove : true;
+    const shadow = cardMode !== "enforce";
+    const response: CardAuthResponse = {
+      approved,
+      shadow,
+      would_approve: wouldApprove,
+      would_decline_reason: wouldDeclineReason,
+      auth_status: authStatus
+    };
+
+    const tx = sqlite.transaction(() => {
+      if (approved || cardMode !== "enforce") {
+        db.insert(cardHolds).values({
+          authId,
+          agentId,
+          amountCents,
+          status: approved ? "pending" : "reversed",
+          createdAt: now,
+          updatedAt: now
+        }).run();
+
+        if (snapshot && approved) {
+          const updatedReservedHolds = snapshot.reservedHoldsCents + amountCents;
+          const confirmedSpendableCents =
+            snapshot.confirmedBalanceCents -
+            snapshot.reservedOutgoingCents -
+            updatedReservedHolds -
+            config.USDC_BUFFER_CENTS;
+          const effectiveSpendPowerCents = Math.min(snapshot.policySpendableCents, confirmedSpendableCents);
+          db.update(agentSpendSnapshot)
+            .set({
+              reservedHoldsCents: updatedReservedHolds,
+              effectiveSpendPowerCents,
+              updatedAt: now
+            })
+            .where(eq(agentSpendSnapshot.agentId, agentId))
+            .run();
+        }
+      }
+
+      const event = appendEvent(db, sqlite, {
+        agentId,
+        userId: agent.userId,
+        type: "card_auth_shadow",
+        payload: {
+          auth_id: authId,
+          card_id: cardId,
+          agent_id: agentId,
+          merchant: body.merchant ?? null,
+          mcc: body.mcc ?? null,
+          amount_cents: amountCents,
+          currency: body.currency ?? null,
+          timestamp: body.timestamp ?? null,
+          metadata: body.metadata ?? null,
+          auth_status: authStatus,
+          shadow_mode: shadow,
+          would_approve: wouldApprove,
+          would_decline_reason: wouldDeclineReason,
+          spend_snapshot: snapshot ?? null,
+          policy_caps: { daily_limit_cents: dailyMax, daily_remaining_cents: dailyRemaining },
+          facts_snapshot: snapshot
+            ? {
+                policy_caps: { daily_limit_cents: dailyMax, daily_remaining_cents: dailyRemaining },
+                reserves: {
+                  reserved_outgoing_cents: snapshot.reservedOutgoingCents,
+                  reserved_holds_cents: snapshot.reservedHoldsCents
+                },
+                buffer_cents: config.USDC_BUFFER_CENTS,
+                confirmed_balance_cents: snapshot.confirmedBalanceCents
+              }
+            : null,
+          response
+        }
+      });
+
+      createReceipt(db, {
+        agentId,
+        userId: agent.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: authId,
+        whatHappened: "Card auth observed in shadow mode.",
+        whyChanged:
+          cardMode === "enforce"
+            ? approved
+              ? "card_auth_approved"
+              : "card_auth_declined"
+            : wouldApprove
+              ? "shadow_would_approve"
+              : "shadow_would_decline",
+        whatHappensNext: "Hold recorded; shadow decision logged."
+      });
+    });
+    tx();
+
+    return reply.send(response);
+  });
+
+  app.post("/api/card/settle", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = request.body as {
+      agent_id?: string;
+      auth_id?: string;
+      settled_amount_cents?: number;
+      settled_at?: number;
+      metadata?: Record<string, unknown>;
+    };
+    const agentId = String(body.agent_id ?? "");
+    const authId = String(body.auth_id ?? "");
+    const settledAmountCents = Number(body.settled_amount_cents);
+    if (!agentId || !authId || !Number.isFinite(settledAmountCents) || settledAmountCents < 0) {
+      return reply.status(400).send({ error: "invalid_request" });
+    }
+
+    const hold = db.select().from(cardHolds).where(eq(cardHolds.authId, authId)).get();
+    if (!hold || hold.agentId !== agentId) {
+      return reply.status(404).send({ error: "hold_not_found" });
+    }
+    if (hold.status === "settled") {
+      return reply.send({ ok: true, idempotent: true });
+    }
+    if (hold.status !== "pending") {
+      return reply.status(409).send({ error: "hold_not_pending" });
+    }
+
+    const agent = db.select().from(agents).where(eq(agents.agentId, agentId)).get();
+    if (!agent) {
+      return reply.status(404).send({ error: "agent_not_found" });
+    }
+
+    const snapshot = db
+      .select()
+      .from(agentSpendSnapshot)
+      .where(eq(agentSpendSnapshot.agentId, agentId))
+      .get() as typeof agentSpendSnapshot.$inferSelect | undefined;
+    if (!snapshot) {
+      return reply.status(409).send({ error: "snapshot_missing" });
+    }
+
+    const now = nowSeconds();
+    const occurredAt = body.settled_at ?? now;
+    const tx = sqlite.transaction(() => {
+      db.update(cardHolds)
+        .set({ status: "settled", updatedAt: now })
+        .where(eq(cardHolds.authId, authId))
+        .run();
+
+      const nextReservedHolds = Math.max(0, snapshot.reservedHoldsCents - hold.amountCents);
+      const confirmedSpendableCents =
+        snapshot.confirmedBalanceCents -
+        snapshot.reservedOutgoingCents -
+        nextReservedHolds -
+        config.USDC_BUFFER_CENTS;
+      const nextEffectiveSpendPower = Math.min(snapshot.policySpendableCents, confirmedSpendableCents);
+
+      db.update(agentSpendSnapshot)
+        .set({
+          reservedHoldsCents: nextReservedHolds,
+          effectiveSpendPowerCents: nextEffectiveSpendPower,
+          updatedAt: now
+        })
+        .where(eq(agentSpendSnapshot.agentId, agentId))
+        .run();
+
+      const factsSnapshot = {
+        policy_caps: {
+          policy_spendable_cents: snapshot.policySpendableCents
+        },
+        reserves: {
+          reserved_outgoing_cents: snapshot.reservedOutgoingCents,
+          reserved_holds_cents: nextReservedHolds
+        },
+        buffer_cents: config.USDC_BUFFER_CENTS,
+        confirmed_balance_cents: snapshot.confirmedBalanceCents
+      };
+
+      const event = appendEvent(db, sqlite, {
+        agentId,
+        userId: agent.userId,
+        type: "card_settled",
+        payload: {
+          auth_id: authId,
+          agent_id: agentId,
+          hold_amount_cents: hold.amountCents,
+          settled_amount_cents: settledAmountCents,
+          settled_at: occurredAt,
+          metadata: body.metadata ?? null,
+          facts_snapshot: factsSnapshot
+        },
+        occurredAt
+      });
+
+      createReceipt(db, {
+        agentId,
+        userId: agent.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: authId,
+        whatHappened: "Card hold settled.",
+        whyChanged: "card_settled",
+        whatHappensNext: "Hold released from reserves.",
+        occurredAt
+      });
+    });
+    tx();
+
+    return reply.send({ ok: true });
+  });
+
+  app.post("/api/card/release", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = request.body as {
+      agent_id?: string;
+      auth_id?: string;
+      reason?: "expired" | "reversed" | "voided";
+      released_at?: number;
+    };
+    const agentId = String(body.agent_id ?? "");
+    const authId = String(body.auth_id ?? "");
+    const reason = body.reason;
+    if (!agentId || !authId || !reason) {
+      return reply.status(400).send({ error: "invalid_request" });
+    }
+
+    const hold = db.select().from(cardHolds).where(eq(cardHolds.authId, authId)).get();
+    if (!hold || hold.agentId !== agentId) {
+      return reply.status(404).send({ error: "hold_not_found" });
+    }
+    if (hold.status === "released") {
+      return reply.send({ ok: true, idempotent: true });
+    }
+    if (hold.status !== "pending") {
+      return reply.status(409).send({ error: "hold_not_pending" });
+    }
+
+    const agent = db.select().from(agents).where(eq(agents.agentId, agentId)).get();
+    if (!agent) {
+      return reply.status(404).send({ error: "agent_not_found" });
+    }
+
+    const snapshot = db
+      .select()
+      .from(agentSpendSnapshot)
+      .where(eq(agentSpendSnapshot.agentId, agentId))
+      .get() as typeof agentSpendSnapshot.$inferSelect | undefined;
+    if (!snapshot) {
+      return reply.status(409).send({ error: "snapshot_missing" });
+    }
+
+    const now = nowSeconds();
+    const occurredAt = body.released_at ?? now;
+    const tx = sqlite.transaction(() => {
+      db.update(cardHolds)
+        .set({ status: "released", updatedAt: now })
+        .where(eq(cardHolds.authId, authId))
+        .run();
+
+      const nextReservedHolds = Math.max(0, snapshot.reservedHoldsCents - hold.amountCents);
+      const confirmedSpendableCents =
+        snapshot.confirmedBalanceCents -
+        snapshot.reservedOutgoingCents -
+        nextReservedHolds -
+        config.USDC_BUFFER_CENTS;
+      const nextEffectiveSpendPower = Math.min(snapshot.policySpendableCents, confirmedSpendableCents);
+
+      db.update(agentSpendSnapshot)
+        .set({
+          reservedHoldsCents: nextReservedHolds,
+          effectiveSpendPowerCents: nextEffectiveSpendPower,
+          updatedAt: now
+        })
+        .where(eq(agentSpendSnapshot.agentId, agentId))
+        .run();
+
+      const factsSnapshot = {
+        policy_caps: {
+          policy_spendable_cents: snapshot.policySpendableCents
+        },
+        reserves: {
+          reserved_outgoing_cents: snapshot.reservedOutgoingCents,
+          reserved_holds_cents: nextReservedHolds
+        },
+        buffer_cents: config.USDC_BUFFER_CENTS,
+        confirmed_balance_cents: snapshot.confirmedBalanceCents
+      };
+
+      const event = appendEvent(db, sqlite, {
+        agentId,
+        userId: agent.userId,
+        type: "card_released",
+        payload: {
+          auth_id: authId,
+          agent_id: agentId,
+          hold_amount_cents: hold.amountCents,
+          released_at: occurredAt,
+          reason,
+          facts_snapshot: factsSnapshot
+        },
+        occurredAt
+      });
+
+      createReceipt(db, {
+        agentId,
+        userId: agent.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: authId,
+        whatHappened: "Card hold released.",
+        whyChanged: "card_released",
+        whatHappensNext: "Hold released from reserves.",
+        occurredAt
+      });
+    });
+    tx();
+
+    return reply.send({ ok: true });
   });
 
   app.post("/api/freeze", async (request, reply) => {
@@ -312,13 +1004,142 @@ export function buildServer(options: {
   return { app, kernel, env, db, sqlite, config };
 }
 
-async function main() {
-  const { app, config } = buildServer();
-  await app.listen({ port: config.PORT, host: "0.0.0.0" });
+export function buildApprovalServer(input: {
+  config: ReturnType<typeof getConfig>;
+  kernel: Kernel;
+  db: DbClient;
+}) {
+  const { config, kernel, db } = input;
+  const app = Fastify({ logger: true });
+
+  app.get("/approve/:challengeId", async (request, reply) => {
+    const params = request.params as { challengeId: string };
+    const challenge = db
+      .select()
+      .from(stepUpChallenges)
+      .where(eq(stepUpChallenges.id, params.challengeId))
+      .get() as typeof stepUpChallenges.$inferSelect | undefined;
+    const now = nowSeconds();
+    if (!challenge) {
+      return reply
+        .status(404)
+        .type("text/html")
+        .send("<!doctype html><html><body><h2>Challenge not found.</h2></body></html>");
+    }
+
+    const expired = challenge.expiresAt <= now;
+    const pending = challenge.status === "pending" && !expired;
+    const statusText = expired
+      ? "expired"
+      : challenge.status === "pending"
+        ? "pending"
+        : challenge.status;
+
+    if (!pending) {
+      return reply
+        .type("text/html")
+        .send(
+          `<!doctype html><html><body><h2>Challenge ${statusText}.</h2><p>challenge_id=${challenge.id}</p></body></html>`
+        );
+    }
+
+    const html = `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Bloom Step-Up Approval</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; padding: 24px; }
+      .card { max-width: 520px; margin: 0 auto; border: 1px solid #ddd; padding: 20px; border-radius: 12px; }
+      input { padding: 8px; font-size: 16px; width: 100%; margin-bottom: 12px; }
+      button { padding: 10px 16px; font-size: 16px; margin-right: 8px; }
+      .meta { color: #555; font-size: 14px; margin-top: 8px; }
+      .result { margin-top: 16px; white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    </style>
+  </head>
+  <body>
+    <div class="card">
+      <h2>Approve spend?</h2>
+      <div class="meta">challenge_id=${challenge.id}</div>
+      <div class="meta">quote_id=${challenge.quoteId}</div>
+      <div class="meta">expires_at=${challenge.expiresAt}</div>
+      <label>Human presence code</label>
+      <input id="code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" />
+      <div>
+        <button id="approve">Approve</button>
+        <button id="deny">Deny</button>
+      </div>
+      <div id="result" class="result"></div>
+    </div>
+    <script>
+      const resultEl = document.getElementById("result");
+      async function submit(decision) {
+        const code = document.getElementById("code").value.trim();
+        resultEl.textContent = "Submitting...";
+        const res = await fetch("/api/step_up/confirm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            challenge_id: "${challenge.id}",
+            decision,
+            code
+          })
+        });
+        const text = await res.text();
+        resultEl.textContent = text || "ok";
+      }
+      document.getElementById("approve").addEventListener("click", () => submit("approve"));
+      document.getElementById("deny").addEventListener("click", () => submit("deny"));
+    </script>
+  </body>
+</html>`;
+
+    return reply.type("text/html").send(html);
+  });
+
+  app.post("/api/step_up/confirm", async (request, reply) => {
+    const ip = request.ip ?? request.socket?.remoteAddress ?? "";
+    if (ip !== "127.0.0.1") {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    const body = request.body as { challenge_id?: string; code?: string; decision?: "approve" | "deny" };
+    if (!body.challenge_id || !body.code || !body.decision) {
+      return reply.status(400).send({ error: "challenge_id_code_decision_required" });
+    }
+    if (body.decision !== "approve" && body.decision !== "deny") {
+      return reply.status(400).send({ error: "invalid_decision" });
+    }
+    const result = await kernel.confirmStepUpChallenge({
+      challenge_id: body.challenge_id,
+      code: body.code,
+      decision: body.decision
+    });
+    if (!result.ok) {
+      return reply.status(400).send({ error: result.reason });
+    }
+    return reply.send(result.response);
+  });
+
+  return app;
 }
 
-main().catch((err) => {
-  // eslint-disable-next-line no-console
-  console.error(err);
-  process.exit(1);
-});
+async function main() {
+  const { app, config, kernel, db } = buildServer();
+  await app.listen({ port: config.PORT, host: "0.0.0.0" });
+  if (config.BIND_APPROVAL_UI) {
+    const approvalApp = buildApprovalServer({ config, kernel, db });
+    await approvalApp.listen({ port: config.APPROVAL_UI_PORT, host: "127.0.0.1" });
+  }
+}
+
+const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : null;
+const isDirectRun =
+  process.env.NODE_ENV !== "test" && entryPath && entryPath === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main().catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(err);
+    process.exit(1);
+  });
+}

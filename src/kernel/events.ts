@@ -1,7 +1,7 @@
 import { events } from "../db/schema.js";
 import { hashEvent, newId, nowSeconds } from "./utils.js";
 import type { DbClient } from "../db/database.js";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 
 export type EventRecord = {
   event_id: string;

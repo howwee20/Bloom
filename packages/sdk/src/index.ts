@@ -36,6 +36,30 @@ export type ReceiptsResponse = {
   }>;
 };
 
+export type StepUpRequestResponse = {
+  challenge_id: string;
+  approval_url: string;
+  expires_at: number;
+};
+
+export type AgentSummaryResponse = {
+  total_spent_cents: number;
+  confirmed_balance_cents: number;
+  reserved_outgoing_cents: number;
+  effective_spend_power_cents: number;
+  last_receipts: ReceiptsResponse["receipts"];
+};
+
+export type TimelineResponse = {
+  timeline: Array<Record<string, unknown>>;
+};
+
+export type ReceiptWithFactsResponse = {
+  receipt: ReceiptsResponse["receipts"][number];
+  facts_snapshot: Record<string, unknown> | null;
+  event: { event_id: string; type: string; payload: Record<string, unknown> } | null;
+};
+
 type RequestOptions = {
   method?: "GET" | "POST";
   body?: Record<string, unknown>;
@@ -99,6 +123,10 @@ export class BloomClient {
     return this.request<ExecuteResponse>("/api/execute", { body: input });
   }
 
+  async requestStepUp(input: { agent_id: string; quote_id: string }): Promise<StepUpRequestResponse> {
+    return this.request<StepUpRequestResponse>("/api/step_up/request", { body: input });
+  }
+
   async getState(agent_id: string): Promise<Record<string, unknown>> {
     return this.request<Record<string, unknown>>(`/api/state?agent_id=${encodeURIComponent(agent_id)}`, {
       method: "GET"
@@ -109,5 +137,29 @@ export class BloomClient {
     const qs = new URLSearchParams({ agent_id: input.agent_id });
     if (input.since) qs.set("since", String(input.since));
     return this.request<ReceiptsResponse>(`/api/receipts?${qs.toString()}`, { method: "GET" });
+  }
+
+  async getSummary(input: { agent_id: string; window?: string }): Promise<AgentSummaryResponse> {
+    const qs = new URLSearchParams();
+    if (input.window) qs.set("window", input.window);
+    return this.request<AgentSummaryResponse>(`/api/agents/${encodeURIComponent(input.agent_id)}/summary?${qs.toString()}`, {
+      method: "GET"
+    });
+  }
+
+  async getTimeline(input: { agent_id: string; since?: number; limit?: number }): Promise<TimelineResponse> {
+    const qs = new URLSearchParams();
+    if (input.since !== undefined) qs.set("since", String(input.since));
+    if (input.limit !== undefined) qs.set("limit", String(input.limit));
+    return this.request<TimelineResponse>(`/api/agents/${encodeURIComponent(input.agent_id)}/timeline?${qs.toString()}`, {
+      method: "GET"
+    });
+  }
+
+  async getReceiptWithFacts(input: { agent_id: string; receipt_id: string }): Promise<ReceiptWithFactsResponse> {
+    return this.request<ReceiptWithFactsResponse>(
+      `/api/agents/${encodeURIComponent(input.agent_id)}/receipt/${encodeURIComponent(input.receipt_id)}`,
+      { method: "GET" }
+    );
   }
 }

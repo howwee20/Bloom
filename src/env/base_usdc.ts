@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { createPublicClient, createWalletClient, getAddress, http } from "viem";
@@ -10,6 +10,7 @@ import { baseUsdcBalanceCache, baseUsdcWallets, envHealth } from "../db/schema.j
 import type { Config } from "../config.js";
 import { nowSeconds } from "../kernel/utils.js";
 import type { EnvEvent, EnvFreshness, EnvFreshnessStatus, EnvObservation, EnvResult, IEnvironment } from "./IEnvironment.js";
+import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 
 const ENV_NAME = "base_usdc";
 
@@ -260,6 +261,13 @@ export class BaseUsdcWorld implements IEnvironment {
         .where(eq(baseUsdcBalanceCache.agentId, agentId))
         .run();
     }
+
+    refreshAgentSpendSnapshot({
+      db: this.db,
+      sqlite: this.sqlite,
+      config: this.config,
+      agentId
+    });
 
     const latestTimestamp = Number(latest.timestamp ?? 0n);
     const status = toFreshnessStatus(now, latestTimestamp, this.config);

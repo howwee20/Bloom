@@ -65,5 +65,45 @@
       "required": ["agent_id"],
       "additionalProperties": false
     }
+  },
+  {
+    "name": "bloom_get_summary",
+    "description": "Fetch a chat-ready spend summary for an agent.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "window": { "type": "string" }
+      },
+      "required": ["agent_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_get_timeline",
+    "description": "Fetch a combined receipts/events timeline for an agent.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "since": { "type": "number" },
+        "limit": { "type": "number" }
+      },
+      "required": ["agent_id"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "bloom_get_receipt",
+    "description": "Fetch a receipt with its decision facts snapshot.",
+    "input_schema": {
+      "type": "object",
+      "properties": {
+        "agent_id": { "type": "string" },
+        "receipt_id": { "type": "string" }
+      },
+      "required": ["agent_id", "receipt_id"],
+      "additionalProperties": false
+    }
   }
 ]

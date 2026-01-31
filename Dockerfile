@@ -5,9 +5,8 @@ WORKDIR /app
 RUN corepack enable
 
 COPY package.json pnpm-lock.yaml* ./
-RUN pnpm install
+RUN pnpm install --frozen-lockfile
 
 COPY . .
-RUN pnpm build
 
-CMD ["node", "dist/api/server.js"]
+CMD ["pnpm", "start"]

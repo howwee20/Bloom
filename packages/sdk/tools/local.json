@@ -61,6 +61,43 @@
         "required": ["agent_id"],
         "additionalProperties": false
       }
+    },
+    {
+      "name": "bloom_get_summary",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "agent_id": { "type": "string" },
+          "window": { "type": "string" }
+        },
+        "required": ["agent_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "bloom_get_timeline",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "agent_id": { "type": "string" },
+          "since": { "type": "number" },
+          "limit": { "type": "number" }
+        },
+        "required": ["agent_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "bloom_get_receipt",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "agent_id": { "type": "string" },
+          "receipt_id": { "type": "string" }
+        },
+        "required": ["agent_id", "receipt_id"],
+        "additionalProperties": false
+      }
     }
   ]
 }

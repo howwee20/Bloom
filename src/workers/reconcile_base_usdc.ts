@@ -7,11 +7,12 @@ import { createDatabase } from "../db/database.js";
 import { getConfig, type Config } from "../config.js";
 import { agents, baseUsdcPendingTxs } from "../db/schema.js";
 import type { DbClient } from "../db/database.js";
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { appendEvent } from "../kernel/events.js";
 import { createReceipt } from "../kernel/receipts.js";
 import { nowSeconds } from "../kernel/utils.js";
 import { eq } from "drizzle-orm";
+import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 
 type RpcReceipt = {
   blockNumber?: bigint | null;
@@ -139,6 +140,13 @@ export async function reconcileBaseUsdcPendingTxs(input: {
         })
         .where(eq(baseUsdcPendingTxs.id, row.id))
         .run();
+
+      refreshAgentSpendSnapshot({
+        db: input.db,
+        sqlite: input.sqlite,
+        config: input.config,
+        agentId: row.agentId
+      });
 
       const event = appendEvent(input.db, input.sqlite, {
         agentId: row.agentId,

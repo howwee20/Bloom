@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import { and, desc, eq, gt } from "drizzle-orm";
 import {
   agents,
@@ -7,11 +7,15 @@ import {
   baseUsdcActionDedup,
   baseUsdcPendingTxs,
   economyPrices,
+  events,
   executions,
   policies,
   quotes,
   receipts,
-  users
+  stepUpChallenges,
+  stepUpTokens,
+  users,
+  agentSpendSnapshot
 } from "../db/schema.js";
 import type { DbClient } from "../db/database.js";
 import type { EnvResult, IEnvironment } from "../env/IEnvironment.js";
@@ -21,6 +25,8 @@ import { createReceipt } from "./receipts.js";
 import { dayStartEpoch, newId, nowSeconds } from "./utils.js";
 import type { Config } from "../config.js";
 import { getAddress } from "viem";
+import { createHash, randomBytes } from "node:crypto";
+import { refreshAgentSpendSnapshot } from "./spend_snapshot.js";
 
 export type CanDoRequest = {
   user_id: string;
@@ -52,6 +58,31 @@ export type ExecuteResponse = {
   reason?: string;
 };
 
+export type StepUpChallengeRequest = {
+  user_id: string;
+  agent_id: string;
+  quote_id: string;
+};
+
+export type StepUpChallengeResponse = {
+  challenge_id: string;
+  expires_at: number;
+  code?: string | null;
+  reused?: boolean;
+};
+
+export type StepUpConfirmRequest = {
+  challenge_id: string;
+  code: string;
+  decision: "approve" | "deny";
+};
+
+export type StepUpConfirmResponse = {
+  status: "approved" | "denied";
+  step_up_token?: string;
+  expires_at?: number;
+};
+
 type PolicyShape = {
   per_intent_limit: Record<string, { max_per_day?: number }>;
   daily_limit: { max_spend_cents?: number };
@@ -72,6 +103,7 @@ type SpendPowerSnapshot = {
   effective_spend_power_cents: number;
   confirmed_balance_cents?: number;
   reserved_outgoing_cents?: number;
+  reserved_holds_cents?: number;
   buffer_cents?: number;
   confirmed_usdc_spendable_cents?: number;
   observed_block_number?: number;
@@ -86,6 +118,7 @@ type ConstraintDecision = {
   transfer_amount_cents?: number;
   intent_type?: string;
   spend_power?: SpendPowerSnapshot;
+  facts_snapshot?: Record<string, unknown>;
 };
 
 function parseJson<T>(value: unknown, fallback: T): T {
@@ -136,6 +169,23 @@ function normalizeUsdcTransferIntent(intent: Record<string, unknown>) {
   }
 }
 
+function hashStepUpCode(challengeId: string, code: string) {
+  return createHash("sha256").update(`${challengeId}:${code}`).digest("hex");
+}
+
+function hashStepUpToken(token: string) {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function generateStepUpCode() {
+  const raw = randomBytes(4).readUInt32BE(0) % 1_000_000;
+  return String(raw).padStart(6, "0");
+}
+
+function generateStepUpToken() {
+  return `stepup_${randomBytes(24).toString("hex")}`;
+}
+
 export class Kernel {
   private db: DbClient;
   private sqlite: Database;
@@ -165,6 +215,13 @@ export class Kernel {
       .prepare(
         "SELECT COALESCE(SUM(amount_cents), 0) as total FROM base_usdc_pending_txs WHERE agent_id = ? AND status = 'pending'"
       )
+      .get(agentId) as { total?: number } | undefined;
+    return row?.total ?? 0;
+  }
+
+  private getReservedHoldCents(agentId: string) {
+    const row = this.sqlite
+      .prepare("SELECT COALESCE(SUM(amount_cents), 0) as total FROM card_holds WHERE agent_id = ? AND status = 'pending'")
       .get(agentId) as { total?: number } | undefined;
     return row?.total ?? 0;
   }
@@ -247,6 +304,13 @@ export class Kernel {
       stepUpThresholdJson: defaultPolicy.step_up_threshold,
       createdAt: now
     }).run();
+
+    refreshAgentSpendSnapshot({
+      db: this.db,
+      sqlite: this.sqlite,
+      config: this.config,
+      agentId
+    });
 
     return { user_id: userId, agent_id: agentId };
   }
@@ -361,7 +425,28 @@ export class Kernel {
     }
 
     const { baseCost, transferAmount } = this.estimateIntentCost(input.intent);
-    const { policySpendableCents, dailyMax } = this.computePolicySpendable(budget, policy, transferAmount);
+    const { policySpendableCents, dailyMax, dailyRemaining } = this.computePolicySpendable(
+      budget,
+      policy,
+      transferAmount
+    );
+    const reservedOutgoingCents = this.getReservedOutgoingCents(input.agentId);
+    const reservedHoldsCents = this.getReservedHoldCents(input.agentId);
+    const policySnapshot = {
+      daily_limit_cents: dailyMax,
+      daily_remaining_cents: dailyRemaining,
+      per_intent_max_per_day: maxPerDay ?? null,
+      step_up_threshold_cents: policy.step_up_threshold.spend_cents ?? null
+    };
+    const factsSnapshotBase = {
+      policy_caps: policySnapshot,
+      reserves: {
+        reserved_outgoing_cents: reservedOutgoingCents,
+        reserved_holds_cents: reservedHoldsCents
+      },
+      buffer_cents: this.config.USDC_BUFFER_CENTS
+    };
+    let factsSnapshot = factsSnapshotBase;
     const includeSpendPower = this.env.envName === "base_usdc";
     const spendPowerBase: SpendPowerSnapshot | undefined = includeSpendPower
       ? {
@@ -373,14 +458,16 @@ export class Kernel {
       return {
         allowed: false,
         reason: "daily_limit_exceeded",
-        ...(spendPowerBase ? { spend_power: spendPowerBase } : {})
+        ...(spendPowerBase ? { spend_power: spendPowerBase } : {}),
+        facts_snapshot: factsSnapshotBase
       };
     }
     if (budget.creditsCents < baseCost + transferAmount) {
       return {
         allowed: false,
         reason: "insufficient_credits",
-        ...(spendPowerBase ? { spend_power: spendPowerBase } : {})
+        ...(spendPowerBase ? { spend_power: spendPowerBase } : {}),
+        facts_snapshot: factsSnapshotBase
       };
     }
 
@@ -390,7 +477,8 @@ export class Kernel {
         return {
           allowed: false,
           reason: `env_${freshness.status}`,
-          ...(spendPowerBase ? { spend_power: spendPowerBase } : {})
+          ...(spendPowerBase ? { spend_power: spendPowerBase } : {}),
+          facts_snapshot: factsSnapshotBase
         };
       }
     }
@@ -405,7 +493,8 @@ export class Kernel {
         return {
           allowed: false,
           reason: "env_observation_failed",
-          spend_power: { ...(spendPowerBase ?? {}), buffer_cents: this.config.USDC_BUFFER_CENTS }
+          spend_power: { ...(spendPowerBase ?? {}), buffer_cents: this.config.USDC_BUFFER_CENTS },
+          facts_snapshot: factsSnapshotBase
         };
       }
 
@@ -413,19 +502,30 @@ export class Kernel {
         return {
           allowed: false,
           reason: "env_observation_invalid",
-          spend_power: { ...(spendPowerBase ?? {}), buffer_cents: this.config.USDC_BUFFER_CENTS }
+          spend_power: { ...(spendPowerBase ?? {}), buffer_cents: this.config.USDC_BUFFER_CENTS },
+          facts_snapshot: factsSnapshotBase
         };
       }
 
-      const reservedOutgoingCents = this.getReservedOutgoingCents(input.agentId);
       const confirmedSpendableCents =
-        observationSnapshot.confirmed_balance_cents - reservedOutgoingCents - this.config.USDC_BUFFER_CENTS;
+        observationSnapshot.confirmed_balance_cents -
+        reservedOutgoingCents -
+        reservedHoldsCents -
+        this.config.USDC_BUFFER_CENTS;
       const effectiveSpendPowerCents = Math.min(policySpendableCents, confirmedSpendableCents);
+      factsSnapshot = {
+        ...factsSnapshotBase,
+        balance_block: {
+          observed_block_number: observationSnapshot.observed_block_number,
+          observed_block_timestamp: observationSnapshot.observed_block_timestamp
+        }
+      };
       spendPower = {
         policy_spendable_cents: policySpendableCents,
         effective_spend_power_cents: effectiveSpendPowerCents,
         confirmed_balance_cents: observationSnapshot.confirmed_balance_cents,
         reserved_outgoing_cents: reservedOutgoingCents,
+        reserved_holds_cents: reservedHoldsCents,
         buffer_cents: observationSnapshot.buffer_cents,
         confirmed_usdc_spendable_cents: confirmedSpendableCents,
         observed_block_number: observationSnapshot.observed_block_number,
@@ -434,19 +534,30 @@ export class Kernel {
 
       const spendCheckAmount = intentType === "usdc_transfer" ? transferAmount : baseCost + transferAmount;
       if (spendCheckAmount > effectiveSpendPowerCents) {
-        return { allowed: false, reason: "insufficient_confirmed_usdc", spend_power: spendPower };
+        return {
+          allowed: false,
+          reason: "insufficient_confirmed_usdc",
+          spend_power: spendPower,
+          facts_snapshot: factsSnapshot
+        };
       }
 
       if (intentType === "usdc_transfer") {
         const hasGas = await this.hasSufficientGas(input.agentId);
         if (!hasGas) {
-          return { allowed: false, reason: "insufficient_gas", spend_power: spendPower };
+          return {
+            allowed: false,
+            reason: "insufficient_gas",
+            spend_power: spendPower,
+            facts_snapshot: factsSnapshot
+          };
         }
       }
     }
 
     const stepUpThreshold = policy.step_up_threshold.spend_cents ?? 1000000;
-    const requiresStepUp = baseCost >= stepUpThreshold;
+    const requiresStepUp =
+      baseCost >= stepUpThreshold || (this.env.envName === "base_usdc" && intentType === "usdc_transfer");
     return {
       allowed: true,
       reason: "ok",
@@ -454,7 +565,8 @@ export class Kernel {
       base_cost_cents: baseCost,
       transfer_amount_cents: transferAmount,
       intent_type: intentType,
-      ...(spendPower ? { spend_power: spendPower } : {})
+      ...(spendPower ? { spend_power: spendPower } : {}),
+      facts_snapshot: factsSnapshot
     };
   }
 
@@ -512,6 +624,7 @@ export class Kernel {
     }).run();
 
     const spendPowerPayload = decision.spend_power ? { spend_power: decision.spend_power } : {};
+    const factsPayload = decision.facts_snapshot ? { facts_snapshot: decision.facts_snapshot } : {};
     const event = appendEvent(this.db, this.sqlite, {
       agentId: input.agent_id,
       userId: input.user_id,
@@ -521,7 +634,8 @@ export class Kernel {
         reason: decision.reason,
         requires_step_up: decision.requires_step_up ?? false,
         intent,
-        ...spendPowerPayload
+        ...spendPowerPayload,
+        ...factsPayload
       }
     });
 
@@ -543,6 +657,206 @@ export class Kernel {
       expires_at: expiresAt,
       idempotency_key: idempotencyKey
     };
+  }
+
+  async requestStepUpChallenge(input: StepUpChallengeRequest): Promise<StepUpChallengeResponse> {
+    const now = nowSeconds();
+    const existing = this.db
+      .select()
+      .from(stepUpChallenges)
+      .where(
+        and(
+          eq(stepUpChallenges.userId, input.user_id),
+          eq(stepUpChallenges.agentId, input.agent_id),
+          eq(stepUpChallenges.quoteId, input.quote_id),
+          eq(stepUpChallenges.status, "pending")
+        )
+      )
+      .get() as typeof stepUpChallenges.$inferSelect | undefined;
+
+    if (existing) {
+      if (existing.expiresAt <= now) {
+        this.db
+          .update(stepUpChallenges)
+          .set({ status: "expired" })
+          .where(eq(stepUpChallenges.id, existing.id))
+          .run();
+      } else {
+        return { challenge_id: existing.id, expires_at: existing.expiresAt, reused: true };
+      }
+    }
+
+    const challengeId = newId("stepup");
+    const code = generateStepUpCode();
+    const expiresAt = now + Math.max(1, this.config.STEP_UP_CHALLENGE_TTL_SECONDS);
+    const codeHash = hashStepUpCode(challengeId, code);
+
+    this.db.insert(stepUpChallenges).values({
+      id: challengeId,
+      userId: input.user_id,
+      agentId: input.agent_id,
+      quoteId: input.quote_id,
+      status: "pending",
+      codeHash,
+      createdAt: now,
+      expiresAt,
+      approvedAt: null
+    }).run();
+
+    const event = appendEvent(this.db, this.sqlite, {
+      agentId: input.agent_id,
+      userId: input.user_id,
+      type: "step_up_requested",
+      payload: { quote_id: input.quote_id, challenge_id: challengeId, expires_at: expiresAt }
+    });
+    createReceipt(this.db, {
+      agentId: input.agent_id,
+      userId: input.user_id,
+      source: "policy",
+      eventId: event.event_id,
+      externalRef: challengeId,
+      whatHappened: "Step-up challenge created.",
+      whyChanged: "step_up_requested",
+      whatHappensNext: "Approve or deny using the local approval UI."
+    });
+
+    return { challenge_id: challengeId, expires_at: expiresAt, code };
+  }
+
+  async confirmStepUpChallenge(
+    input: StepUpConfirmRequest
+  ): Promise<{ ok: true; response: StepUpConfirmResponse } | { ok: false; reason: string }> {
+    const now = nowSeconds();
+    const challenge = this.db
+      .select()
+      .from(stepUpChallenges)
+      .where(eq(stepUpChallenges.id, input.challenge_id))
+      .get() as typeof stepUpChallenges.$inferSelect | undefined;
+    if (!challenge) {
+      return { ok: false, reason: "challenge_not_found" };
+    }
+    if (challenge.status !== "pending") {
+      return { ok: false, reason: "challenge_not_pending" };
+    }
+    if (challenge.expiresAt <= now) {
+      this.db
+        .update(stepUpChallenges)
+        .set({ status: "expired" })
+        .where(eq(stepUpChallenges.id, challenge.id))
+        .run();
+      return { ok: false, reason: "challenge_expired" };
+    }
+
+    const codeHash = hashStepUpCode(challenge.id, input.code);
+    if (codeHash !== challenge.codeHash) {
+      return { ok: false, reason: "invalid_code" };
+    }
+
+    if (input.decision === "deny") {
+      this.db
+        .update(stepUpChallenges)
+        .set({ status: "denied" })
+        .where(eq(stepUpChallenges.id, challenge.id))
+        .run();
+      const event = appendEvent(this.db, this.sqlite, {
+        agentId: challenge.agentId,
+        userId: challenge.userId,
+        type: "step_up_denied",
+        payload: { quote_id: challenge.quoteId, challenge_id: challenge.id }
+      });
+      createReceipt(this.db, {
+        agentId: challenge.agentId,
+        userId: challenge.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: challenge.id,
+        whatHappened: "Step-up challenge denied.",
+        whyChanged: "step_up_denied",
+        whatHappensNext: "Execution will remain blocked."
+      });
+      return { ok: true, response: { status: "denied" } };
+    }
+
+    const token = generateStepUpToken();
+    const tokenHash = hashStepUpToken(token);
+    const tokenExpiresAt = now + Math.max(1, this.config.STEP_UP_TOKEN_TTL_SECONDS);
+
+    const tx = this.sqlite.transaction(() => {
+      this.db
+        .update(stepUpChallenges)
+        .set({ status: "approved", approvedAt: now })
+        .where(eq(stepUpChallenges.id, challenge.id))
+        .run();
+      this.db.insert(stepUpTokens).values({
+        id: newId("stepup_token"),
+        challengeId: challenge.id,
+        tokenHash,
+        createdAt: now,
+        expiresAt: tokenExpiresAt
+      }).run();
+    });
+    tx();
+
+    const event = appendEvent(this.db, this.sqlite, {
+      agentId: challenge.agentId,
+      userId: challenge.userId,
+      type: "step_up_approved",
+      payload: { quote_id: challenge.quoteId, challenge_id: challenge.id, expires_at: tokenExpiresAt }
+    });
+    createReceipt(this.db, {
+      agentId: challenge.agentId,
+      userId: challenge.userId,
+      source: "policy",
+      eventId: event.event_id,
+      externalRef: challenge.id,
+      whatHappened: "Step-up challenge approved.",
+      whyChanged: "step_up_approved",
+      whatHappensNext: "Use the step-up token before it expires."
+    });
+
+    return {
+      ok: true,
+      response: { status: "approved", step_up_token: token, expires_at: tokenExpiresAt }
+    };
+  }
+
+  private validateStepUpToken(input: {
+    userId: string;
+    agentId: string;
+    quoteId: string;
+    token: string;
+  }):
+    | { ok: true; tokenId: string; challengeId: string }
+    | { ok: false; reason: string } {
+    const tokenHash = hashStepUpToken(input.token);
+    const tokenRow = this.db
+      .select()
+      .from(stepUpTokens)
+      .where(eq(stepUpTokens.tokenHash, tokenHash))
+      .get() as typeof stepUpTokens.$inferSelect | undefined;
+    if (!tokenRow) {
+      return { ok: false, reason: "step_up_token_invalid" };
+    }
+    const now = nowSeconds();
+    if (tokenRow.expiresAt <= now) {
+      return { ok: false, reason: "step_up_token_expired" };
+    }
+    const challenge = this.db
+      .select()
+      .from(stepUpChallenges)
+      .where(eq(stepUpChallenges.id, tokenRow.challengeId))
+      .get() as typeof stepUpChallenges.$inferSelect | undefined;
+    if (!challenge || challenge.status !== "approved") {
+      return { ok: false, reason: "step_up_challenge_invalid" };
+    }
+    if (
+      challenge.userId !== input.userId ||
+      challenge.agentId !== input.agentId ||
+      challenge.quoteId !== input.quoteId
+    ) {
+      return { ok: false, reason: "step_up_mismatch" };
+    }
+    return { ok: true, tokenId: tokenRow.id, challengeId: challenge.id };
   }
 
   async execute(input: ExecuteRequest): Promise<ExecuteResponse> {
@@ -636,11 +950,17 @@ export class Kernel {
 
     if (!decision.allowed) {
       const spendPowerPayload = decision.spend_power ? { spend_power: decision.spend_power } : {};
+      const factsPayload = decision.facts_snapshot ? { facts_snapshot: decision.facts_snapshot } : {};
       const event = appendEvent(this.db, this.sqlite, {
         agentId: quote.agentId,
         userId: quote.userId,
         type: "execution_rejected",
-        payload: { reason: decision.reason ?? "rejected", quote_id: quote.quoteId, ...spendPowerPayload }
+        payload: {
+          reason: decision.reason ?? "rejected",
+          quote_id: quote.quoteId,
+          ...spendPowerPayload,
+          ...factsPayload
+        }
       });
       createReceipt(this.db, {
         agentId: quote.agentId,
@@ -656,7 +976,7 @@ export class Kernel {
     }
 
     if (decision.requires_step_up) {
-      if (!input.step_up_token || input.step_up_token !== this.config.STEP_UP_SHARED_SECRET) {
+      if (!input.step_up_token) {
         const event = appendEvent(this.db, this.sqlite, {
           agentId: quote.agentId,
           userId: quote.userId,
@@ -675,9 +995,56 @@ export class Kernel {
         });
         return { status: "rejected", reason: "step_up_required" };
       }
+      const validation = this.validateStepUpToken({
+        userId: quote.userId,
+        agentId: quote.agentId,
+        quoteId: quote.quoteId,
+        token: input.step_up_token
+      });
+      if (!validation.ok) {
+        const event = appendEvent(this.db, this.sqlite, {
+          agentId: quote.agentId,
+          userId: quote.userId,
+          type: "execution_rejected",
+          payload: { reason: validation.reason, quote_id: quote.quoteId }
+        });
+        createReceipt(this.db, {
+          agentId: quote.agentId,
+          userId: quote.userId,
+          source: "policy",
+          eventId: event.event_id,
+          externalRef: quote.quoteId,
+          whatHappened: "Execution rejected: invalid step-up token.",
+          whyChanged: validation.reason,
+          whatHappensNext: "Request a new step-up challenge."
+        });
+        return { status: "rejected", reason: validation.reason };
+      }
+
+      const stepUpEvent = appendEvent(this.db, this.sqlite, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        type: "step_up_used",
+        payload: {
+          quote_id: quote.quoteId,
+          challenge_id: validation.challengeId,
+          token_id: validation.tokenId
+        }
+      });
+      createReceipt(this.db, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        source: "policy",
+        eventId: stepUpEvent.event_id,
+        externalRef: quote.quoteId,
+        whatHappened: "Step-up token accepted.",
+        whyChanged: "step_up_used",
+        whatHappensNext: "Execution will proceed."
+      });
     }
 
     const policySpendPayload = decision.spend_power ? { spend_power: decision.spend_power } : {};
+    const policyFactsPayload = decision.facts_snapshot ? { facts_snapshot: decision.facts_snapshot } : {};
     const policyEvent = appendEvent(this.db, this.sqlite, {
       agentId: quote.agentId,
       userId: quote.userId,
@@ -686,7 +1053,8 @@ export class Kernel {
         allowed: true,
         intent_type: decision.intent_type,
         quote_id: quote.quoteId,
-        ...policySpendPayload
+        ...policySpendPayload,
+        ...policyFactsPayload
       }
     });
     createReceipt(this.db, {
@@ -749,6 +1117,13 @@ export class Kernel {
         })
         .where(eq(budgets.agentId, quote.agentId))
         .run();
+
+      refreshAgentSpendSnapshot({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        agentId: quote.agentId
+      });
 
       const reserveEvent = appendEvent(this.db, this.sqlite, {
         agentId: quote.agentId,
@@ -1113,6 +1488,12 @@ export class Kernel {
           createdAt: now,
           updatedAt: now
         }).run();
+        refreshAgentSpendSnapshot({
+          db: this.db,
+          sqlite: this.sqlite,
+          config: this.config,
+          agentId: quote.agentId
+        });
       }
 
       const resultPayload = {
@@ -1351,13 +1732,18 @@ export class Kernel {
         const snapshot = this.extractUsdcObservationSnapshot(observation as Record<string, unknown>);
         if (snapshot) {
           const reservedOutgoingCents = this.getReservedOutgoingCents(agentId);
+          const reservedHoldsCents = this.getReservedHoldCents(agentId);
           const confirmedSpendableCents =
-            snapshot.confirmed_balance_cents - reservedOutgoingCents - this.config.USDC_BUFFER_CENTS;
+            snapshot.confirmed_balance_cents -
+            reservedOutgoingCents -
+            reservedHoldsCents -
+            this.config.USDC_BUFFER_CENTS;
           spendPower = {
             policy_spendable_cents: policySpendableCents,
             effective_spend_power_cents: Math.min(policySpendableCents, confirmedSpendableCents),
             confirmed_balance_cents: snapshot.confirmed_balance_cents,
             reserved_outgoing_cents: reservedOutgoingCents,
+            reserved_holds_cents: reservedHoldsCents,
             buffer_cents: snapshot.buffer_cents,
             confirmed_usdc_spendable_cents: confirmedSpendableCents,
             observed_block_number: snapshot.observed_block_number,
@@ -1378,6 +1764,129 @@ export class Kernel {
       observation,
       env_freshness: freshness,
       ...(spendPower ? { spend_power: spendPower } : {})
+    };
+  }
+
+  getAgentSummary(agentId: string, windowSeconds: number) {
+    const now = nowSeconds();
+    const window = Math.max(0, windowSeconds);
+    const since = window > 0 ? now - window : 0;
+    const snapshot =
+      refreshAgentSpendSnapshot({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        agentId
+      }) ??
+      (this.db
+        .select()
+        .from(agentSpendSnapshot)
+        .where(eq(agentSpendSnapshot.agentId, agentId))
+        .get() as typeof agentSpendSnapshot.$inferSelect | undefined);
+
+    const totalRow = this.sqlite
+      .prepare(
+        "SELECT COALESCE(SUM(amount_cents), 0) as total FROM base_usdc_pending_txs WHERE agent_id = ? AND status IN ('pending','confirmed') AND created_at >= ?"
+      )
+      .get(agentId, since) as { total?: number } | undefined;
+    const totalSpentCents = totalRow?.total ?? 0;
+
+    const receiptsRows = this.db
+      .select()
+      .from(receipts)
+      .where(since ? and(eq(receipts.agentId, agentId), gt(receipts.createdAt, since)) : eq(receipts.agentId, agentId))
+      .orderBy(desc(receipts.createdAt))
+      .limit(10)
+      .all();
+
+    return {
+      total_spent_cents: totalSpentCents,
+      confirmed_balance_cents: snapshot?.confirmedBalanceCents ?? 0,
+      reserved_outgoing_cents: snapshot?.reservedOutgoingCents ?? 0,
+      effective_spend_power_cents: snapshot?.effectiveSpendPowerCents ?? 0,
+      last_receipts: receiptsRows
+    };
+  }
+
+  getAgentTimeline(agentId: string, since?: number, limit?: number) {
+    const max = Math.max(1, limit ?? 50);
+    const receiptRows = this.db
+      .select()
+      .from(receipts)
+      .where(
+        since
+          ? and(eq(receipts.agentId, agentId), gt(receipts.occurredAt, since))
+          : eq(receipts.agentId, agentId)
+      )
+      .orderBy(desc(receipts.occurredAt))
+      .limit(max)
+      .all();
+
+    const eventRows = this.db
+      .select()
+      .from(events)
+      .where(
+        since ? and(eq(events.agentId, agentId), gt(events.occurredAt, since)) : eq(events.agentId, agentId)
+      )
+      .orderBy(desc(events.occurredAt))
+      .limit(max)
+      .all();
+
+    const combined = [
+      ...receiptRows.map((row) => ({
+        id: row.receiptId,
+        ts: row.occurredAt,
+        kind: "receipt" as const,
+        type: row.source,
+        what_happened: row.whatHappened,
+        why_changed: row.whyChanged,
+        what_happens_next: row.whatHappensNext,
+        event_id: row.eventId,
+        external_ref: row.externalRef
+      })),
+      ...eventRows.map((row) => ({
+        id: row.eventId,
+        ts: row.occurredAt,
+        kind: "event" as const,
+        type: row.type,
+        payload: parseJson<Record<string, unknown>>(row.payloadJson, {})
+      }))
+    ];
+
+    combined.sort((a, b) => {
+      if (b.ts !== a.ts) return b.ts - a.ts;
+      return a.id.localeCompare(b.id);
+    });
+
+    return combined.slice(0, max);
+  }
+
+  getReceiptWithFacts(agentId: string, receiptId: string) {
+    const receipt = this.db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.receiptId, receiptId))
+      .get() as typeof receipts.$inferSelect | undefined;
+    if (!receipt || receipt.agentId !== agentId) return null;
+    const event = receipt.eventId
+      ? (this.db
+          .select()
+          .from(events)
+          .where(eq(events.eventId, receipt.eventId))
+          .get() as typeof events.$inferSelect | undefined)
+      : undefined;
+    const payload = event ? parseJson<Record<string, unknown>>(event.payloadJson, {}) : undefined;
+    const factsSnapshot = payload && typeof payload === "object" ? (payload as Record<string, unknown>).facts_snapshot : undefined;
+    return {
+      receipt,
+      facts_snapshot: factsSnapshot ?? null,
+      event: event
+        ? {
+            event_id: event.eventId,
+            type: event.type,
+            payload
+          }
+        : null
     };
   }
 

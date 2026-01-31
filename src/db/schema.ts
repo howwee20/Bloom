@@ -1,4 +1,4 @@
-import { sqliteTable, text, integer, real, primaryKey, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sqliteTable, text, integer, real, primaryKey, uniqueIndex, index } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   userId: text("user_id").primaryKey(),
@@ -120,6 +120,57 @@ export const receipts = sqliteTable("receipts", {
   whatHappensNext: text("what_happens_next").notNull(),
   occurredAt: integer("occurred_at").notNull(),
   createdAt: integer("created_at").notNull()
+});
+
+export const stepUpChallenges = sqliteTable(
+  "step_up_challenges",
+  {
+    id: text("id").primaryKey(),
+    userId: text("user_id").notNull(),
+    agentId: text("agent_id").notNull(),
+    quoteId: text("quote_id").notNull(),
+    status: text("status").notNull(),
+    codeHash: text("code_hash").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull(),
+    approvedAt: integer("approved_at")
+  }
+);
+
+export const stepUpTokens = sqliteTable(
+  "step_up_tokens",
+  {
+    id: text("id").primaryKey(),
+    challengeId: text("challenge_id").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    createdAt: integer("created_at").notNull(),
+    expiresAt: integer("expires_at").notNull()
+  }
+);
+
+export const cardHolds = sqliteTable(
+  "card_holds",
+  {
+    agentId: text("agent_id").notNull(),
+    authId: text("auth_id").primaryKey(),
+    amountCents: integer("amount_cents").notNull(),
+    status: text("status").notNull(),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull()
+  },
+  (table) => ({
+    agentStatusIndex: index("card_holds_agent_status_idx").on(table.agentId, table.status)
+  })
+);
+
+export const agentSpendSnapshot = sqliteTable("agent_spend_snapshot", {
+  agentId: text("agent_id").primaryKey(),
+  confirmedBalanceCents: integer("confirmed_balance_cents").notNull(),
+  reservedOutgoingCents: integer("reserved_outgoing_cents").notNull(),
+  reservedHoldsCents: integer("reserved_holds_cents").notNull(),
+  policySpendableCents: integer("policy_spendable_cents").notNull(),
+  effectiveSpendPowerCents: integer("effective_spend_power_cents").notNull(),
+  updatedAt: integer("updated_at").notNull()
 });
 
 export const envHealth = sqliteTable("env_health", {

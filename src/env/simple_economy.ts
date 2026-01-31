@@ -1,4 +1,4 @@
-import type Database from "better-sqlite3";
+import Database from "better-sqlite3";
 import type { DbClient } from "../db/database.js";
 import {
   economyActionDedup,

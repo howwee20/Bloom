@@ -8,14 +8,14 @@ services:
       - "3000:3000"
     volumes:
       - bloom_data:/data
-    command: ["sh", "-c", "pnpm migrate && node dist/api/server.js"]
+    command: ["sh", "-c", "pnpm migrate && pnpm start"]
 
   worker:
     build: .
     env_file: .env
     volumes:
       - bloom_data:/data
-    command: ["sh", "-c", "pnpm migrate && node dist/workers/reconcile_base_usdc.js"]
+    command: ["sh", "-c", "pnpm migrate && pnpm worker:base_usdc"]
 
 volumes:
   bloom_data:

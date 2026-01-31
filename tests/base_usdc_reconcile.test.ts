@@ -26,13 +26,20 @@ type FakeEnvClient = {
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
   return {
+    API_VERSION: "0.1.0-alpha",
     DB_PATH: ":memory:",
     PORT: 0,
+    APPROVAL_UI_PORT: 0,
+    BIND_APPROVAL_UI: false,
+    CARD_MODE: "dev",
+    CARD_WEBHOOK_SHARED_SECRET: null,
     ADMIN_API_KEY: null,
     ENV_TYPE: "base_usdc",
     ENV_STALE_SECONDS: 60,
     ENV_UNKNOWN_SECONDS: 300,
     STEP_UP_SHARED_SECRET: null,
+    STEP_UP_CHALLENGE_TTL_SECONDS: 120,
+    STEP_UP_TOKEN_TTL_SECONDS: 60,
     DEFAULT_CREDITS_CENTS: 100000,
     DEFAULT_DAILY_SPEND_CENTS: 100000,
     BASE_RPC_URL: "http://localhost:8545",

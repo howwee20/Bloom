@@ -12,13 +12,20 @@ const TEST_MNEMONIC = "test test test test test test test test test test test ju
 
 function makeConfig(overrides: Partial<Config> = {}): Config {
   return {
+    API_VERSION: "0.1.0-alpha",
     DB_PATH: ":memory:",
     PORT: 0,
+    APPROVAL_UI_PORT: 0,
+    BIND_APPROVAL_UI: false,
+    CARD_MODE: "dev",
+    CARD_WEBHOOK_SHARED_SECRET: null,
     ADMIN_API_KEY: null,
     ENV_TYPE: "base_usdc",
     ENV_STALE_SECONDS: 60,
     ENV_UNKNOWN_SECONDS: 300,
     STEP_UP_SHARED_SECRET: null,
+    STEP_UP_CHALLENGE_TTL_SECONDS: 120,
+    STEP_UP_TOKEN_TTL_SECONDS: 60,
     DEFAULT_CREDITS_CENTS: 0,
     DEFAULT_DAILY_SPEND_CENTS: 0,
     BASE_RPC_URL: "http://localhost:8545",
@@ -84,6 +91,28 @@ function createBaseUsdcKernel(
   return { sqlite, db, env, kernel, config };
 }
 
+async function approveStepUp(input: {
+  kernel: Kernel;
+  user_id: string;
+  agent_id: string;
+  quote_id: string;
+}) {
+  const challenge = await input.kernel.requestStepUpChallenge({
+    user_id: input.user_id,
+    agent_id: input.agent_id,
+    quote_id: input.quote_id
+  });
+  const approval = await input.kernel.confirmStepUpChallenge({
+    challenge_id: challenge.challenge_id,
+    code: challenge.code as string,
+    decision: "approve"
+  });
+  if (!approval.ok || !approval.response.step_up_token) {
+    throw new Error("step_up_approval_failed");
+  }
+  return approval.response.step_up_token;
+}
+
 describe("BaseUsdcWorld", () => {
   it("classifies freshness from latest block age", async () => {
     const now = nowSeconds();
@@ -128,15 +157,14 @@ describe("BaseUsdcWorld", () => {
       latest: { number: 42n, timestamp: BigInt(now - 5) },
       balance: 0n
     });
-    const { sqlite, db } = createDatabase(":memory:");
-    applyMigrations(sqlite);
-    const env = new BaseUsdcWorld(db, sqlite, makeConfig(), { client });
+    const { kernel, env, db } = createBaseUsdcKernel(client);
+    const { agent_id } = kernel.createAgent();
 
-    const first = await env.getObservation("agent_alpha");
-    const second = await env.getObservation("agent_alpha");
+    const first = await env.getObservation(agent_id);
+    const second = await env.getObservation(agent_id);
 
     expect(first.wallet_address).toEqual(second.wallet_address);
-    const rows = db.select().from(baseUsdcWallets).where(eq(baseUsdcWallets.agentId, "agent_alpha")).all();
+    const rows = db.select().from(baseUsdcWallets).where(eq(baseUsdcWallets.agentId, agent_id)).all();
     expect(rows.length).toBe(1);
   });
 
@@ -150,11 +178,10 @@ describe("BaseUsdcWorld", () => {
       blocks,
       balance: 1_234_567n
     });
-    const { sqlite, db } = createDatabase(":memory:");
-    applyMigrations(sqlite);
-    const env = new BaseUsdcWorld(db, sqlite, makeConfig({ CONFIRMATIONS_REQUIRED: 5 }), { client });
+    const { kernel, env, db } = createBaseUsdcKernel(client, { CONFIRMATIONS_REQUIRED: 5 });
+    const { agent_id } = kernel.createAgent();
 
-    const observation = await env.getObservation("agent_beta");
+    const observation = await env.getObservation(agent_id);
     expect(observation.confirmed_balance_cents).toBe(123);
     expect(observation.observed_block_number).toBe(95);
     expect(observation.observed_block_timestamp).toBe(Number(safeBlock.timestamp));
@@ -162,7 +189,7 @@ describe("BaseUsdcWorld", () => {
     const cache = db
       .select()
       .from(baseUsdcBalanceCache)
-      .where(eq(baseUsdcBalanceCache.agentId, "agent_beta"))
+      .where(eq(baseUsdcBalanceCache.agentId, agent_id))
       .get();
     expect(cache?.confirmedBalanceCents).toBe(123);
     expect(cache?.observedBlockNumber).toBe(95);
@@ -293,7 +320,12 @@ describe("BaseUsdc usdc_transfer", () => {
     });
     expect(quote.allowed).toBe(true);
 
-    const exec = await kernel.execute({ quote_id: quote.quote_id, idempotency_key: quote.idempotency_key });
+    const stepUpToken = await approveStepUp({ kernel, user_id, agent_id, quote_id: quote.quote_id });
+    const exec = await kernel.execute({
+      quote_id: quote.quote_id,
+      idempotency_key: quote.idempotency_key,
+      step_up_token: stepUpToken
+    });
     expect(exec.status).toBe("applied");
     expect(broadcasts).toBe(1);
 
@@ -395,7 +427,12 @@ describe("BaseUsdc usdc_transfer", () => {
     expect(quote.allowed).toBe(true);
 
     balance = 10_000_000n;
-    const res = await kernel.execute({ quote_id: quote.quote_id, idempotency_key: quote.idempotency_key });
+    const stepUpToken = await approveStepUp({ kernel, user_id, agent_id, quote_id: quote.quote_id });
+    const res = await kernel.execute({
+      quote_id: quote.quote_id,
+      idempotency_key: quote.idempotency_key,
+      step_up_token: stepUpToken
+    });
     expect(res.status).toBe("rejected");
     expect(res.reason).toBe("insufficient_confirmed_usdc");
     expect(broadcasts).toBe(0);
