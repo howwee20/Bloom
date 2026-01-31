@@ -18,7 +18,7 @@ function applyMigration(sqlite: import("better-sqlite3").Database, name: string,
   const now = Math.floor(Date.now() / 1000);
   const tx = sqlite.transaction(() => {
     sqlite.exec(sql);
-    sqlite.prepare("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(name, now);
+    sqlite.prepare("INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?, ?)").run(name, now);
   });
   tx();
 }
