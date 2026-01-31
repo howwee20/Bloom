@@ -7,8 +7,15 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      ADMIN_API_KEY: ci_admin_key
+      DEV_MASTER_MNEMONIC: "test test test test test test test test test test test junk"
+      CARD_WEBHOOK_SHARED_SECRET: "ci_card_secret"
+      CARD_MODE: dev
     steps:
       - uses: actions/checkout@v4
+      - name: Install native module build deps
+        run: sudo apt-get update && sudo apt-get install -y python3 make g++
       - uses: pnpm/action-setup@v4
         with:
           version: 9
@@ -16,7 +23,7 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
       - run: pnpm test
       - run: mkdir -p tmp
       - run: DB_PATH=./tmp/replay.db pnpm migrate
