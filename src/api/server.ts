@@ -1,3 +1,4 @@
+import "dotenv/config";
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import fs from "node:fs";

@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 export type Config = {
   API_VERSION: string;
   DB_PATH: string;
@@ -23,11 +25,29 @@ export type Config = {
   DEV_MASTER_MNEMONIC: string | null;
 };
 
+function isRunningInDocker() {
+  if (process.env.BLOOM_DOCKER === "true" || process.env.DOCKER === "true") return true;
+  if (fs.existsSync("/.dockerenv") || fs.existsSync("/.containerenv")) return true;
+  try {
+    const cgroup = fs.readFileSync("/proc/1/cgroup", "utf8");
+    if (cgroup.includes("docker") || cgroup.includes("containerd") || cgroup.includes("kubepods")) return true;
+  } catch {
+    // Non-Linux hosts won't have /proc.
+  }
+  return false;
+}
+
 export function getConfig(): Config {
   const env = process.env;
+  const runningInDocker = isRunningInDocker();
+  const defaultDbPath = runningInDocker ? "/data/kernel.db" : "./data/kernel.db";
+  const dbPath = env.DB_PATH ?? defaultDbPath;
+  if (dbPath === "/data/kernel.db" && !runningInDocker) {
+    throw new Error("DB_PATH=/data/kernel.db is reserved for Docker. Use ./data/kernel.db or set BLOOM_DOCKER=true.");
+  }
   return {
     API_VERSION: env.API_VERSION ?? "0.1.0-alpha",
-    DB_PATH: env.DB_PATH ?? "./data/kernel.db",
+    DB_PATH: dbPath,
     PORT: env.PORT ? Number(env.PORT) : 3000,
     APPROVAL_UI_PORT: env.APPROVAL_UI_PORT ? Number(env.APPROVAL_UI_PORT) : 3001,
     BIND_APPROVAL_UI: env.BIND_APPROVAL_UI === "true",

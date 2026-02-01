@@ -18,10 +18,15 @@
     "replay": "tsx src/workers/replay.ts",
     "release:alpha": "pnpm install && pnpm test && node scripts/release_tag.cjs",
     "worker:base_usdc": "tsx src/workers/reconcile_base_usdc.ts",
-    "mcp": "tsx src/mcp/server.ts",
-    "mcp:smoke": "tsx scripts/mcp_smoke_test.ts"
+    "mcp": "node --no-warnings --loader tsx src/mcp/server.ts",
+    "mcp:smoke": "tsx scripts/mcp_smoke_test.ts",
+    "preflight": "tsx scripts/preflight.ts",
+    "keys:mint": "tsx scripts/keys_mint.ts",
+    "agent:init": "tsx scripts/agent_init.ts",
+    "env:print": "tsx scripts/env_print.ts"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "@modelcontextprotocol/sdk": "^0.6.0",
     "better-sqlite3": "^9.4.5",
     "drizzle-orm": "^0.38.2",

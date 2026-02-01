@@ -281,9 +281,11 @@ Edit your Claude Desktop config file:
 {
   "mcpServers": {
     "bloom": {
-      "command": "pnpm",
-      "args": ["mcp"],
-      "cwd": "/path/to/Bloom",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm use 20 >/dev/null; cd /path/to/Bloom; node --no-warnings --loader tsx src/mcp/server.ts"
+      ],
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
         "BLOOM_READ_KEY": "your_read_only_api_key",
@@ -294,7 +296,7 @@ Edit your Claude Desktop config file:
 }
 ```
 
-Replace `/path/to/Bloom` with your actual repo path.
+Replace `/path/to/Bloom` with your actual repo path. This avoids pnpm/tsx banners on stdout, keeping the MCP protocol clean.
 
 ### Step 3: Restart Claude Desktop
 
