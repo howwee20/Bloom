@@ -18,8 +18,8 @@ Use this template for GitHub Release descriptions.
 ```bash
 # Prerequisites: Docker Desktop
 
-git clone https://github.com/howwee20/BloomAI.git
-cd BloomAI
+git clone https://github.com/howwee20/Bloom.git
+cd Bloom
 cp .env.example .env
 docker compose up -d --build
 
@@ -76,7 +76,7 @@ docker compose down --volumes # Stop and wipe all data
 ## Quickstart
 
 \`\`\`bash
-git clone https://github.com/howwee20/BloomAI.git && cd BloomAI
+git clone https://github.com/howwee20/Bloom.git && cd Bloom
 cp .env.example .env
 docker compose up -d --build
 curl http://localhost:3000/healthz

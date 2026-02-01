@@ -63,8 +63,8 @@ The one true way to run the kernel. Works on any machine with Docker Desktop.
 ### Run the Kernel
 
 ```bash
-git clone https://github.com/howwee20/BloomAI.git
-cd BloomAI
+git clone https://github.com/howwee20/Bloom.git
+cd Bloom
 cp .env.example .env
 docker compose up -d --build
 ```
@@ -283,7 +283,7 @@ Edit your Claude Desktop config file:
     "bloom": {
       "command": "pnpm",
       "args": ["mcp"],
-      "cwd": "/path/to/BloomAI",
+      "cwd": "/path/to/Bloom",
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
         "BLOOM_READ_KEY": "your_read_only_api_key",
@@ -294,7 +294,7 @@ Edit your Claude Desktop config file:
 }
 ```
 
-Replace `/path/to/BloomAI` with your actual repo path.
+Replace `/path/to/Bloom` with your actual repo path.
 
 ### Step 3: Restart Claude Desktop
 
