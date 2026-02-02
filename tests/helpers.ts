@@ -3,6 +3,7 @@ import path from "node:path";
 import { createDatabase } from "../src/db/database.js";
 import { SimpleEconomyWorld } from "../src/env/simple_economy.js";
 import { Kernel } from "../src/kernel/kernel.js";
+import { PolymarketDryrunDriver } from "../src/drivers/polymarket_dryrun_driver.js";
 import type { Config } from "../src/config.js";
 
 export function applyMigrations(sqlite: import("better-sqlite3").Database) {
@@ -40,9 +41,21 @@ export function createTestContext(overrides: Partial<Config> = {}) {
     BASE_USDC_CONTRACT: overrides.BASE_USDC_CONTRACT ?? null,
     CONFIRMATIONS_REQUIRED: overrides.CONFIRMATIONS_REQUIRED ?? 5,
     USDC_BUFFER_CENTS: overrides.USDC_BUFFER_CENTS ?? 0,
-    DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null
+    DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null,
+    BLOOM_ALLOW_TRANSFER: overrides.BLOOM_ALLOW_TRANSFER ?? false,
+    BLOOM_ALLOW_TRANSFER_AGENT_IDS: overrides.BLOOM_ALLOW_TRANSFER_AGENT_IDS ?? [],
+    BLOOM_ALLOW_TRANSFER_TO: overrides.BLOOM_ALLOW_TRANSFER_TO ?? [],
+    BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS: overrides.BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS ?? null,
+    BLOOM_AUTO_APPROVE_AGENT_IDS: overrides.BLOOM_AUTO_APPROVE_AGENT_IDS ?? [],
+    BLOOM_AUTO_APPROVE_TO: overrides.BLOOM_AUTO_APPROVE_TO ?? [],
+    BLOOM_ALLOW_POLYMARKET: overrides.BLOOM_ALLOW_POLYMARKET ?? false,
+    BLOOM_ALLOW_POLYMARKET_AGENT_IDS: overrides.BLOOM_ALLOW_POLYMARKET_AGENT_IDS ?? [],
+    POLY_DRYRUN_MAX_PER_ORDER_CENTS: overrides.POLY_DRYRUN_MAX_PER_ORDER_CENTS ?? 500,
+    POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: overrides.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS ?? 2000,
+    POLY_DRYRUN_MAX_OPEN_ORDERS: overrides.POLY_DRYRUN_MAX_OPEN_ORDERS ?? 20,
+    POLY_DRYRUN_LOOP_SECONDS: overrides.POLY_DRYRUN_LOOP_SECONDS ?? 30
   };
   const env = new SimpleEconomyWorld(db, sqlite, config);
-  const kernel = new Kernel(db, sqlite, env, config);
+  const kernel = new Kernel(db, sqlite, env, config, [new PolymarketDryrunDriver()]);
   return { sqlite, db, env, kernel, config };
 }

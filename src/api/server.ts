@@ -33,6 +33,9 @@ import { appendEvent } from "../kernel/events.js";
 import { createReceipt } from "../kernel/receipts.js";
 import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 import { CARD_SIGNATURE_HEADER, CARD_TIMESTAMP_HEADER, verifyCardSignature } from "./card_webhook.js";
+import { PolymarketDryrunBot } from "../bots/polymarket_dryrun_bot.js";
+import { PolymarketDryrunDriver } from "../drivers/polymarket_dryrun_driver.js";
+import { buildUiActivity, formatMoney, formatUpdated } from "../presentation/index.js";
 
 type AuthUser = {
   userId: string;
@@ -86,6 +89,34 @@ function parseJson<T>(value: unknown, fallback: T): T {
     }
   }
   return value as T;
+}
+
+function normalizeTransferIntentType(intent: Record<string, unknown>) {
+  const raw = String(intent.type ?? "");
+  if (raw === "send_usdc" || raw === "base_usdc_transfer" || raw === "base_usdc_send") return "usdc_transfer";
+  return raw;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim().length > 0) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function isAutoApproveTransfer(config: ReturnType<typeof getConfig>, agentId: string, intent: Record<string, unknown>) {
+  if (config.ENV_TYPE !== "base_usdc") return false;
+  if (normalizeTransferIntentType(intent) !== "usdc_transfer") return false;
+  if (!config.BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS || config.BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS <= 0) return false;
+  if (!config.BLOOM_AUTO_APPROVE_AGENT_IDS.includes(agentId)) return false;
+  const toAddress = String(intent.to_address ?? "").trim().toLowerCase();
+  if (!toAddress) return false;
+  if (config.BLOOM_AUTO_APPROVE_TO.length > 0 && !config.BLOOM_AUTO_APPROVE_TO.includes(toAddress)) return false;
+  const amount = toFiniteNumber(intent.amount_cents);
+  if (amount === null || !Number.isInteger(amount) || amount <= 0) return false;
+  return amount <= config.BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS;
 }
 
 function hasScope(scopes: string[] | undefined, required: "read" | "propose" | "execute" | "owner") {
@@ -252,7 +283,8 @@ export function buildServer(options: {
     (config.ENV_TYPE === "base_usdc"
       ? new BaseUsdcWorld(db, sqlite, config)
       : new SimpleEconomyWorld(db, sqlite, config));
-  const kernel = new Kernel(db, sqlite, env, config);
+  const kernel = new Kernel(db, sqlite, env, config, [new PolymarketDryrunDriver()]);
+  const polymarketBot = new PolymarketDryrunBot(db, sqlite, config);
 
   const app = Fastify({ logger: true });
 
@@ -366,6 +398,84 @@ export function buildServer(options: {
     return reply.send(result);
   });
 
+  app.post("/api/auto_execute", async (request, reply) => {
+    const body = request.body as {
+      user_id?: string;
+      agent_id?: string;
+      intent_json?: Record<string, unknown>;
+      idempotency_key?: string;
+    };
+    if (!body.agent_id || !body.intent_json) {
+      return reply.status(400).send({ error: "agent_id_and_intent_json_required" });
+    }
+    if (!requireScope(request, reply, "propose")) return;
+    const authUser = request.authUser as AuthUser;
+    if (body.user_id && body.user_id !== authUser.userId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    const ownership = ensureAgentOwnership(db, body.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+
+    const intentType = normalizeTransferIntentType(body.intent_json);
+    const isPolymarket =
+      intentType === "polymarket_place_order" || intentType === "polymarket_cancel_order";
+    if (intentType !== "usdc_transfer" && !isPolymarket) {
+      return reply.status(400).send({ error: "unsupported_intent" });
+    }
+
+    const quote = await kernel.canDo({
+      agent_id: body.agent_id,
+      user_id: authUser.userId,
+      intent_json: body.intent_json,
+      idempotency_key: body.idempotency_key
+    });
+
+    if (!quote.allowed) {
+      return reply.send({ quote, execution: null, auto_approved: false, step_up_required: false });
+    }
+
+    if (quote.requires_step_up) {
+      if (intentType !== "usdc_transfer") {
+        return reply.send({ quote, execution: null, auto_approved: false, step_up_required: true });
+      }
+      if (!isAutoApproveTransfer(config, body.agent_id, body.intent_json)) {
+        return reply.send({ quote, execution: null, auto_approved: false, step_up_required: true });
+      }
+
+      const challenge = await kernel.requestStepUpChallenge({
+        user_id: authUser.userId,
+        agent_id: body.agent_id,
+        quote_id: quote.quote_id
+      });
+      if (!challenge.code) {
+        return reply.send({ quote, execution: null, auto_approved: false, step_up_required: true });
+      }
+      const approval = await kernel.confirmStepUpChallenge({
+        challenge_id: challenge.challenge_id,
+        code: challenge.code,
+        decision: "approve"
+      });
+      if (!approval.ok || approval.response.status !== "approved" || !approval.response.step_up_token) {
+        return reply
+          .status(400)
+          .send({ error: approval.ok ? "step_up_denied" : approval.reason, quote });
+      }
+
+      const execution = await kernel.execute({
+        quote_id: quote.quote_id,
+        idempotency_key: quote.idempotency_key,
+        step_up_token: approval.response.step_up_token
+      });
+      return reply.send({ quote, execution, auto_approved: true, step_up_required: false });
+    }
+
+    const execution = await kernel.execute({
+      quote_id: quote.quote_id,
+      idempotency_key: quote.idempotency_key
+    });
+    return reply.send({ quote, execution, auto_approved: false, step_up_required: false });
+  });
+
   app.post("/api/execute", async (request, reply) => {
     const body = request.body as {
       quote_id: string;
@@ -383,6 +493,31 @@ export function buildServer(options: {
     const stepUpToken = body.step_up_token ?? (stepUpHeader.length > 0 ? stepUpHeader : undefined);
     const result = await kernel.execute({ ...body, step_up_token: stepUpToken });
     return reply.send(result);
+  });
+
+  app.post("/api/bots/polymarket_dryrun/start", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = (request.body ?? {}) as { agent_id?: string };
+    const agentId = String(body.agent_id ?? "").trim();
+    if (!agentId) return reply.status(400).send({ error: "agent_id_required" });
+    try {
+      const status = polymarketBot.start(agentId);
+      return reply.send(status);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid_request";
+      return reply.status(400).send({ error: message });
+    }
+  });
+
+  app.post("/api/bots/polymarket_dryrun/stop", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const status = polymarketBot.stop();
+    return reply.send(status);
+  });
+
+  app.get("/api/bots/polymarket_dryrun/status", async (request, reply) => {
+    if (!requireScope(request, reply, "read")) return;
+    return reply.send(polymarketBot.status());
   });
 
   app.post("/api/step_up/request", async (request, reply) => {
@@ -413,6 +548,39 @@ export function buildServer(options: {
     return reply.send({ challenge_id: challenge.challenge_id, approval_url: approvalUrl, expires_at: challenge.expires_at });
   });
 
+  app.post("/api/step_up/approve", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = (request.body ?? {}) as { quote_id?: string; approve?: boolean };
+    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.requiresStepUp !== 1) return reply.status(400).send({ error: "step_up_not_required" });
+
+    const decision = body.approve === false ? "deny" : "approve";
+    const challenge = await kernel.requestStepUpChallenge({
+      user_id: quote.userId,
+      agent_id: quote.agentId,
+      quote_id: quote.quoteId
+    });
+    if (!challenge.code) return reply.status(409).send({ error: "step_up_pending" });
+
+    const approval = await kernel.confirmStepUpChallenge({
+      challenge_id: challenge.challenge_id,
+      code: challenge.code,
+      decision
+    });
+    if (!approval.ok) return reply.status(400).send({ error: approval.reason });
+
+    if (approval.response.status === "approved") {
+      return reply.send({
+        status: "approved",
+        step_up_token: approval.response.step_up_token,
+        expires_at: approval.response.expires_at
+      });
+    }
+    return reply.send({ status: "denied" });
+  });
+
   app.get("/api/state", async (request, reply) => {
     const query = request.query as { agent_id?: string };
     if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
@@ -434,6 +602,73 @@ export function buildServer(options: {
     const since = query.since ? Number(query.since) : undefined;
     const rows = kernel.getReceipts(query.agent_id, since);
     return reply.send({ receipts: rows });
+  });
+
+  app.get("/api/ui/state", async (request, reply) => {
+    const query = request.query as { agent_id?: string };
+    if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, query.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+
+    const snapshot =
+      refreshAgentSpendSnapshot({ db, sqlite, config, agentId: query.agent_id }) ??
+      (db.select().from(agentSpendSnapshot).where(eq(agentSpendSnapshot.agentId, query.agent_id)).get() as
+        | typeof agentSpendSnapshot.$inferSelect
+        | undefined);
+
+    const balanceCents = snapshot?.confirmedBalanceCents ?? 0;
+    const heldCents =
+      (snapshot?.reservedOutgoingCents ?? 0) +
+      (snapshot?.reservedHoldsCents ?? 0) +
+      config.USDC_BUFFER_CENTS;
+    const spendableCents = snapshot?.effectiveSpendPowerCents ?? 0;
+    const updatedAt = snapshot?.updatedAt ?? nowSeconds();
+    const now = nowSeconds();
+
+    return reply.send({
+      agent_id: query.agent_id,
+      number: formatMoney(spendableCents),
+      balance: `${formatMoney(balanceCents)} balance`,
+      held: `${formatMoney(heldCents)} held`,
+      net_worth: formatMoney(balanceCents),
+      updated: formatUpdated(updatedAt, now),
+      details: {
+        spendable_cents: spendableCents,
+        balance_cents: balanceCents,
+        held_cents: heldCents
+      }
+    });
+  });
+
+  app.get("/api/ui/activity", async (request, reply) => {
+    const query = request.query as { agent_id?: string; limit?: string; mode?: string };
+    if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
+    if (!requireScope(request, reply, "read")) return;
+    const authUser = request.authUser as AuthUser;
+    const ownership = ensureAgentOwnership(db, query.agent_id, authUser.userId);
+    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+
+    if (query.mode === "full") {
+      const rows = kernel.getReceipts(query.agent_id);
+      return reply.send({ receipts: rows });
+    }
+
+    const limit = query.limit ? Number(query.limit) : 20;
+    const bounded = Number.isFinite(limit) ? Math.min(100, Math.max(1, Math.floor(limit))) : 20;
+    const receiptLimit = Math.min(500, Math.max(200, bounded * 20));
+
+    const rows = db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.agentId, query.agent_id))
+      .orderBy(desc(receipts.createdAt))
+      .limit(receiptLimit)
+      .all();
+
+    const activity = buildUiActivity(rows, { limit: bounded, nowSeconds: nowSeconds() });
+    return reply.send(activity);
   });
 
   app.get("/api/agents/:agent_id/summary", async (request, reply) => {

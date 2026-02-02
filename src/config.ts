@@ -23,6 +23,18 @@ export type Config = {
   CONFIRMATIONS_REQUIRED: number;
   USDC_BUFFER_CENTS: number;
   DEV_MASTER_MNEMONIC: string | null;
+  BLOOM_ALLOW_TRANSFER: boolean;
+  BLOOM_ALLOW_TRANSFER_AGENT_IDS: string[];
+  BLOOM_ALLOW_TRANSFER_TO: string[];
+  BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS: number | null;
+  BLOOM_AUTO_APPROVE_AGENT_IDS: string[];
+  BLOOM_AUTO_APPROVE_TO: string[];
+  BLOOM_ALLOW_POLYMARKET: boolean;
+  BLOOM_ALLOW_POLYMARKET_AGENT_IDS: string[];
+  POLY_DRYRUN_MAX_PER_ORDER_CENTS: number;
+  POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: number;
+  POLY_DRYRUN_MAX_OPEN_ORDERS: number;
+  POLY_DRYRUN_LOOP_SECONDS: number;
 };
 
 function isRunningInDocker() {
@@ -35,6 +47,22 @@ function isRunningInDocker() {
     // Non-Linux hosts won't have /proc.
   }
   return false;
+}
+
+function parseCsv(value: string | undefined | null) {
+  if (!value) return [];
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+function parseOptionalInt(value: string | undefined | null) {
+  if (!value) return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (!Number.isSafeInteger(parsed)) return null;
+  return parsed;
 }
 
 export function getConfig(): Config {
@@ -69,6 +97,22 @@ export function getConfig(): Config {
     BASE_USDC_CONTRACT: env.BASE_USDC_CONTRACT ?? null,
     CONFIRMATIONS_REQUIRED: env.CONFIRMATIONS_REQUIRED ? Number(env.CONFIRMATIONS_REQUIRED) : 5,
     USDC_BUFFER_CENTS: env.USDC_BUFFER_CENTS ? Number(env.USDC_BUFFER_CENTS) : 0,
-    DEV_MASTER_MNEMONIC: env.DEV_MASTER_MNEMONIC ?? null
+    DEV_MASTER_MNEMONIC: env.DEV_MASTER_MNEMONIC ?? null,
+    BLOOM_ALLOW_TRANSFER: env.BLOOM_ALLOW_TRANSFER === "true",
+    BLOOM_ALLOW_TRANSFER_AGENT_IDS: parseCsv(env.BLOOM_ALLOW_TRANSFER_AGENT_IDS),
+    BLOOM_ALLOW_TRANSFER_TO: parseCsv(env.BLOOM_ALLOW_TRANSFER_TO).map((entry) => entry.toLowerCase()),
+    BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS: parseOptionalInt(env.BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS),
+    BLOOM_AUTO_APPROVE_AGENT_IDS: parseCsv(env.BLOOM_AUTO_APPROVE_AGENT_IDS),
+    BLOOM_AUTO_APPROVE_TO: parseCsv(env.BLOOM_AUTO_APPROVE_TO).map((entry) => entry.toLowerCase()),
+    BLOOM_ALLOW_POLYMARKET: env.BLOOM_ALLOW_POLYMARKET === "true",
+    BLOOM_ALLOW_POLYMARKET_AGENT_IDS: parseCsv(env.BLOOM_ALLOW_POLYMARKET_AGENT_IDS),
+    POLY_DRYRUN_MAX_PER_ORDER_CENTS: env.POLY_DRYRUN_MAX_PER_ORDER_CENTS
+      ? Number(env.POLY_DRYRUN_MAX_PER_ORDER_CENTS)
+      : 500,
+    POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: env.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS
+      ? Number(env.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS)
+      : 2000,
+    POLY_DRYRUN_MAX_OPEN_ORDERS: env.POLY_DRYRUN_MAX_OPEN_ORDERS ? Number(env.POLY_DRYRUN_MAX_OPEN_ORDERS) : 20,
+    POLY_DRYRUN_LOOP_SECONDS: env.POLY_DRYRUN_LOOP_SECONDS ? Number(env.POLY_DRYRUN_LOOP_SECONDS) : 30
   };
 }

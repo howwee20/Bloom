@@ -34,6 +34,18 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     CONFIRMATIONS_REQUIRED: 5,
     USDC_BUFFER_CENTS: 0,
     DEV_MASTER_MNEMONIC: TEST_MNEMONIC,
+    BLOOM_ALLOW_TRANSFER: false,
+    BLOOM_ALLOW_TRANSFER_AGENT_IDS: [],
+    BLOOM_ALLOW_TRANSFER_TO: [],
+    BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS: null,
+    BLOOM_AUTO_APPROVE_AGENT_IDS: [],
+    BLOOM_AUTO_APPROVE_TO: [],
+    BLOOM_ALLOW_POLYMARKET: false,
+    BLOOM_ALLOW_POLYMARKET_AGENT_IDS: [],
+    POLY_DRYRUN_MAX_PER_ORDER_CENTS: 500,
+    POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: 2000,
+    POLY_DRYRUN_MAX_OPEN_ORDERS: 20,
+    POLY_DRYRUN_LOOP_SECONDS: 30,
     ...overrides
   };
 }
@@ -292,6 +304,73 @@ describe("BaseUsdc on-chain bound", () => {
 });
 
 describe("BaseUsdc usdc_transfer", () => {
+  const allowTransferConfig = {
+    BLOOM_ALLOW_TRANSFER: true,
+    BLOOM_ALLOW_TRANSFER_AGENT_IDS: ["agent_ej"],
+    BLOOM_ALLOW_TRANSFER_TO: []
+  };
+
+  it("denies transfer by default without allowlist", async () => {
+    const now = nowSeconds();
+    const client = createFakeClient({
+      latest: { number: 400n, timestamp: BigInt(now - 5) },
+      balance: 500_000_000n,
+      ethBalance: 1n
+    });
+    const { kernel } = createBaseUsdcKernel(client);
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
+
+    const quote = await kernel.canDo({
+      user_id,
+      agent_id,
+      intent_json: {
+        type: "send_usdc",
+        to_address: "0x1111111111111111111111111111111111111111",
+        amount_cents: 100
+      }
+    });
+    expect(quote.allowed).toBe(false);
+    expect(quote.reason).toBe("intent_not_allowlisted");
+  });
+
+  it("allows transfer when agent and recipient are allowlisted", async () => {
+    const now = nowSeconds();
+    const client = createFakeClient({
+      latest: { number: 400n, timestamp: BigInt(now - 5) },
+      balance: 500_000_000n,
+      ethBalance: 1n
+    });
+    const { kernel } = createBaseUsdcKernel(client, {
+      BLOOM_ALLOW_TRANSFER: true,
+      BLOOM_ALLOW_TRANSFER_AGENT_IDS: ["agent_ej"],
+      BLOOM_ALLOW_TRANSFER_TO: ["0x1111111111111111111111111111111111111111"]
+    });
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
+
+    const allowedQuote = await kernel.canDo({
+      user_id,
+      agent_id,
+      intent_json: {
+        type: "base_usdc_send",
+        to_address: "0x1111111111111111111111111111111111111111",
+        amount_cents: 100
+      }
+    });
+    expect(allowedQuote.allowed).toBe(true);
+
+    const deniedQuote = await kernel.canDo({
+      user_id,
+      agent_id,
+      intent_json: {
+        type: "send_usdc",
+        to_address: "0x2222222222222222222222222222222222222222",
+        amount_cents: 100
+      }
+    });
+    expect(deniedQuote.allowed).toBe(false);
+    expect(deniedQuote.reason).toBe("intent_not_allowlisted");
+  });
+
   it("broadcasts once and records pending tx", async () => {
     const now = nowSeconds();
     const client = createFakeClient({
@@ -306,8 +385,8 @@ describe("BaseUsdc usdc_transfer", () => {
         return "0xabc0000000000000000000000000000000000000000000000000000000000000" as `0x${string}`;
       }
     });
-    const { kernel, db } = createBaseUsdcKernel(client, {}, { walletClientFactory });
-    const { user_id, agent_id } = kernel.createAgent();
+    const { kernel, db } = createBaseUsdcKernel(client, allowTransferConfig, { walletClientFactory });
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
 
     const quote = await kernel.canDo({
       user_id,
@@ -362,8 +441,8 @@ describe("BaseUsdc usdc_transfer", () => {
       balance: 500_000_000n,
       ethBalance: 1n
     });
-    const { kernel } = createBaseUsdcKernel(client);
-    const { user_id, agent_id } = kernel.createAgent();
+    const { kernel } = createBaseUsdcKernel(client, allowTransferConfig);
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
 
     const quote = await kernel.canDo({
       user_id,
@@ -381,8 +460,8 @@ describe("BaseUsdc usdc_transfer", () => {
       balance: 500_000_000n,
       ethBalance: 0n
     });
-    const { kernel } = createBaseUsdcKernel(client);
-    const { user_id, agent_id } = kernel.createAgent();
+    const { kernel } = createBaseUsdcKernel(client, allowTransferConfig);
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
 
     const quote = await kernel.canDo({
       user_id,
@@ -412,8 +491,8 @@ describe("BaseUsdc usdc_transfer", () => {
         return "0xdef0000000000000000000000000000000000000000000000000000000000000" as `0x${string}`;
       }
     });
-    const { kernel } = createBaseUsdcKernel(client, {}, { walletClientFactory });
-    const { user_id, agent_id } = kernel.createAgent();
+    const { kernel } = createBaseUsdcKernel(client, allowTransferConfig, { walletClientFactory });
+    const { user_id, agent_id } = kernel.createAgent({ agentId: "agent_ej" });
 
     const quote = await kernel.canDo({
       user_id,

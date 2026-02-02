@@ -155,11 +155,34 @@ export const cardHolds = sqliteTable(
     authId: text("auth_id").primaryKey(),
     amountCents: integer("amount_cents").notNull(),
     status: text("status").notNull(),
+    source: text("source").notNull().default("card"),
     createdAt: integer("created_at").notNull(),
     updatedAt: integer("updated_at").notNull()
   },
   (table) => ({
     agentStatusIndex: index("card_holds_agent_status_idx").on(table.agentId, table.status)
+  })
+);
+
+export const polymarketOrders = sqliteTable(
+  "polymarket_orders",
+  {
+    orderId: text("order_id").primaryKey(),
+    agentId: text("agent_id").notNull(),
+    marketSlug: text("market_slug").notNull(),
+    tokenId: text("token_id").notNull(),
+    side: text("side").notNull(),
+    price: real("price").notNull(),
+    size: real("size").notNull(),
+    costCents: integer("cost_cents").notNull(),
+    status: text("status").notNull(),
+    clientOrderId: text("client_order_id"),
+    createdAt: integer("created_at").notNull(),
+    updatedAt: integer("updated_at").notNull()
+  },
+  (table) => ({
+    agentStatusIndex: index("polymarket_orders_agent_status_idx").on(table.agentId, table.status),
+    agentClientUnique: uniqueIndex("polymarket_orders_agent_client_unique").on(table.agentId, table.clientOrderId)
   })
 );
 

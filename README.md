@@ -46,6 +46,39 @@ Public API surfaces (stable response fields)
 - `POST /api/admin/keys` -> `key_id`, `user_id`, `api_key`, `scopes`
 - `POST /api/admin/keys/revoke` -> `ok`
 
+
+## UX Semantics (Client Layer)
+
+The kernel stays precise; the UI layer translates.
+
+Canonical user terms
+- Big number: spendable now (no label), e.g. "$6.00"
+- Balance: confirmed total, e.g. "$8.00 balance"
+- Held: reserved outgoing + holds + buffer, e.g. "$2.00 held"
+- Net worth: currently equals balance, e.g. "$8.00"
+
+Three depths of receipts
+- Glance: one-line activity items ("Sent $1.00 · 0x56B0…3351 · Pending")
+- Summary: 3–4 steps (Approved → Held → Sent → Confirmed)
+- Full audit: raw receipts (developer mode)
+
+UI endpoints (read key)
+- `GET /api/ui/state?agent_id=...`
+- `GET /api/ui/activity?agent_id=...&limit=...`
+- `GET /api/ui/activity?agent_id=...&mode=full` (raw receipts)
+
+Example curl
+```bash
+curl -s 'http://localhost:3000/api/ui/state?agent_id=AGENT_ID' \
+  -H 'x-api-key: READ_API_KEY'
+
+curl -s 'http://localhost:3000/api/ui/activity?agent_id=AGENT_ID&limit=10' \
+  -H 'x-api-key: READ_API_KEY'
+
+curl -s 'http://localhost:3000/api/ui/activity?agent_id=AGENT_ID&mode=full' \
+  -H 'x-api-key: READ_API_KEY'
+```
+
 Not in contract
 - Client SDKs, CLI tooling, or example apps.
 - The approval UI or any other web UI.
@@ -154,9 +187,86 @@ pnpm dev
 - `CONFIRMATIONS_REQUIRED` (default `5`)
 - `USDC_BUFFER_CENTS` (default `0`)
 - `DEV_MASTER_MNEMONIC` (required when `ENV_TYPE=base_usdc`; **insecure dev-only**)
+- `BLOOM_ALLOW_TRANSFER` (`true` to allow `usdc_transfer` intents for explicitly allowlisted agents; default `false`)
+- `BLOOM_ALLOW_TRANSFER_AGENT_IDS` (comma-separated agent ids allowed to transfer, e.g. `agent_ej`)
+- `BLOOM_ALLOW_TRANSFER_TO` (comma-separated recipient addresses allowed for transfers; optional)
+- `BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS` (auto-approve transfers up to this amount, e.g. `200`)
+- `BLOOM_AUTO_APPROVE_AGENT_IDS` (comma-separated agent ids allowed for auto-approve)
+- `BLOOM_AUTO_APPROVE_TO` (comma-separated recipient addresses allowed for auto-approve; optional)
+- `BLOOM_ALLOW_POLYMARKET` (`true` to allow Polymarket dry-run intents for explicitly allowlisted agents; default `false`)
+- `BLOOM_ALLOW_POLYMARKET_AGENT_IDS` (comma-separated agent ids allowed to place/cancel dry-run orders)
+- `POLY_DRYRUN_MAX_PER_ORDER_CENTS` (default `500`)
+- `POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS` (default `2000`)
+- `POLY_DRYRUN_MAX_OPEN_ORDERS` (default `20`)
+- `POLY_DRYRUN_LOOP_SECONDS` (default `30`)
 - `BLOOM_BASE_URL` (MCP server base URL)
 - `BLOOM_READ_KEY` (MCP read-only key)
 - `BLOOM_PROPOSE_KEY` (MCP propose-only key)
+
+**Dev transfer allowlist**
+
+To enable USDC transfers for a specific agent during development:
+
+```bash
+export BLOOM_ALLOW_TRANSFER=true
+export BLOOM_ALLOW_TRANSFER_AGENT_IDS=agent_ej
+# Optional recipient allowlist
+export BLOOM_ALLOW_TRANSFER_TO=0x56B0e5Ce4f03a82B5e46ACaE4e93e49Ada453351
+```
+
+Canonical intent type is `usdc_transfer` (aliases: `send_usdc`, `base_usdc_transfer`, `base_usdc_send`).
+
+To auto-approve small transfers for the allowlisted agent/recipient:
+
+```bash
+export BLOOM_AUTO_APPROVE_TRANSFER_MAX_CENTS=200
+export BLOOM_AUTO_APPROVE_AGENT_IDS=agent_ej
+export BLOOM_AUTO_APPROVE_TO=0x56B0e5Ce4f03a82B5e46ACaE4e93e49Ada453351
+```
+
+## Polymarket driver (Phase 1 dry-run)
+
+Phase 1 is a dry-run-only driver: no Polymarket API calls and no trading. It enforces policy gates, spend power bounds,
+open-hold limits, idempotency, and emits receipts for each step.
+
+**Env vars**
+
+```bash
+export BLOOM_ALLOW_POLYMARKET=true
+export BLOOM_ALLOW_POLYMARKET_AGENT_IDS=agent_ej
+export POLY_DRYRUN_MAX_PER_ORDER_CENTS=500
+export POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS=2000
+export POLY_DRYRUN_MAX_OPEN_ORDERS=20
+export POLY_DRYRUN_LOOP_SECONDS=30
+```
+
+**Run server / worker**
+
+```bash
+pnpm dev
+# If ENV_TYPE=base_usdc, run the reconciliation worker too:
+pnpm worker:base_usdc
+```
+
+**Claude Desktop MCP examples**
+
+Example prompts (after adding MCP keys to Claude Desktop config):
+
+- "Place a polymarket dry-run BUY order: market=test_market token=YES_123 price=0.42 size=10 for agent_ej"
+- "Cancel a polymarket dry-run order: order_id=ORDER_ID for agent_ej"
+- "Start polymarket dryrun bot for agent_ej"
+- "Show polymarket dryrun bot status"
+
+Bot start/stop requires `BLOOM_ADMIN_KEY` in the MCP server environment.
+
+**CLI**
+
+```bash
+pnpm polymarket:dryrun --agent agent_ej --market "test_market" --token "YES_123" --price 0.42 --size 10
+```
+
+The CLI uses `BLOOM_PROPOSE_KEY` for `/api/can_do`, `BLOOM_EXECUTE_KEY` for `/api/execute`, and `BLOOM_READ_KEY` to
+print `reserved_holds_cents` when available.
 
 ## API examples
 
@@ -168,6 +278,10 @@ curl -s -X POST http://localhost:3000/api/agents \
 curl -s -X POST http://localhost:3000/api/can_do \
   -H 'content-type: application/json' \
   -d '{"user_id":"user_1","agent_id":"agent_1","intent_json":{"type":"request_job"}}'
+
+curl -s -X POST http://localhost:3000/api/auto_execute \
+  -H 'content-type: application/json' \
+  -d '{"agent_id":"agent_1","intent_json":{"type":"send_usdc","to_address":"0x...","amount_cents":100}}'
 
 curl -s -X POST http://localhost:3000/api/execute \
   -H 'content-type: application/json' \
@@ -201,6 +315,14 @@ curl -s -X POST http://localhost:3000/api/step_up/request \
   -H 'content-type: application/json' \
   -H 'x-api-key: OWNER_API_KEY' \
   -d '{"agent_id":"AGENT_ID","quote_id":"QUOTE_ID"}'
+```
+
+Optional admin shortcut (dev-only):
+```bash
+curl -s -X POST http://localhost:3000/api/step_up/approve \
+  -H 'content-type: application/json' \
+  -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
+  -d '{"quote_id":"QUOTE_ID","approve":true}'
 ```
 
 3) Open the returned `approval_url` on the same machine (127.0.0.1). A 6-digit code is printed to server stdout.
@@ -245,9 +367,12 @@ The MCP server enables Claude Desktop to read agent state and propose actions. B
 
 | Tool | Description | Scope Required |
 |------|-------------|----------------|
-| `bloom_get_state` | Fetch agent state and observation | read |
-| `bloom_list_receipts` | List receipts for an agent | read |
+| `bloom_ui_state` | Fetch user-facing spendable/balance/held | read |
+| `bloom_ui_activity` | Fetch user-facing activity rollups | read |
+| `bloom_get_state` | Fetch raw state and observation (full audit) | read |
+| `bloom_list_receipts` | List raw receipts (full audit) | read |
 | `bloom_can_do` | Request a quote (propose only) | propose |
+
 
 No `execute` tool is exposed. This is intentional.
 
@@ -284,7 +409,7 @@ Edit your Claude Desktop config file:
       "command": "bash",
       "args": [
         "-lc",
-        "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm use 20 >/dev/null; cd /path/to/Bloom; node --no-warnings --loader tsx src/mcp/server.ts"
+        "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm use 20 >/dev/null; cd /path/to/Bloom; node --import tsx src/mcp/server.ts"
       ],
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
@@ -310,15 +435,20 @@ Bloom MCP ready | http://localhost:3000
 Once configured, ask Claude:
 
 1. **"Show spend summary for agent_ej"**
-   - Uses `bloom_get_state` to fetch current observation and spend power
+   - Uses `bloom_ui_state` to fetch human-friendly totals
 
-2. **"List last 10 receipts for agent_ej"**
-   - Uses `bloom_list_receipts` to show transaction history
+2. **"Show recent activity for agent_ej"**
+   - Uses `bloom_ui_activity` for glance + summary items
 
 3. **"Can agent_ej send $1.00 to 0x1111111111111111111111111111111111111111?"**
    - Uses `bloom_can_do` to check if transfer is allowed
    - Returns a quote with `allowed: true/false`
    - Does NOT execute - human approval required out-of-band
+
+Example Claude phrases (UI-first)
+- "What's the spendable number for agent_ej? Use bloom_ui_state."
+- "Show agent_ej activity (last 5). Use bloom_ui_activity."
+- "Show full audit receipts for agent_ej."
 
 ### MCP Smoke Test
 

@@ -24,6 +24,7 @@ import { appendEvent } from "./events.js";
 import { createReceipt } from "./receipts.js";
 import { dayStartEpoch, newId, nowSeconds } from "./utils.js";
 import type { Config } from "../config.js";
+import type { DriverBudgetContext, DriverPreConstraintsContext, IntentDriver } from "../drivers/intent_driver.js";
 import { getAddress } from "viem";
 import { createHash, randomBytes } from "node:crypto";
 import { refreshAgentSpendSnapshot } from "./spend_snapshot.js";
@@ -134,7 +135,9 @@ function parseJson<T>(value: unknown, fallback: T): T {
 }
 
 function getIntentType(intent: Record<string, unknown>) {
-  return String(intent.type ?? "");
+  const raw = String(intent.type ?? "");
+  if (raw === "send_usdc" || raw === "transfer_usdc" || raw === "base_usdc_transfer" || raw === "base_usdc_send") return "usdc_transfer";
+  return raw;
 }
 
 function toFiniteNumber(value: unknown): number | null {
@@ -191,12 +194,18 @@ export class Kernel {
   private sqlite: Database;
   private env: IEnvironment;
   private config: Config;
+  private intentDrivers: IntentDriver[];
 
-  constructor(db: DbClient, sqlite: Database, env: IEnvironment, config: Config) {
+  constructor(db: DbClient, sqlite: Database, env: IEnvironment, config: Config, intentDrivers: IntentDriver[] = []) {
     this.db = db;
     this.sqlite = sqlite;
     this.env = env;
     this.config = config;
+    this.intentDrivers = intentDrivers;
+  }
+
+  private getIntentDriver(intentType: string) {
+    return this.intentDrivers.find((driver) => driver.supports(intentType)) ?? null;
   }
 
   private computePolicySpendable(
@@ -350,6 +359,8 @@ export class Kernel {
 
   private estimateIntentCost(intent: Record<string, unknown>) {
     const type = getIntentType(intent);
+    const driverCost = this.getIntentDriver(type)?.getIntentCost?.(intent);
+    if (driverCost) return driverCost;
     const priceRow = this.db
       .select()
       .from(economyPrices)
@@ -377,6 +388,18 @@ export class Kernel {
     return count;
   }
 
+  private isUsdcTransferAllowlisted(agentId: string, intent: Record<string, unknown>) {
+    if (this.env.envName !== "base_usdc") return false;
+    if (!this.config.BLOOM_ALLOW_TRANSFER) return false;
+    const allowedAgents = this.config.BLOOM_ALLOW_TRANSFER_AGENT_IDS;
+    if (allowedAgents.length === 0 || !allowedAgents.includes(agentId)) return false;
+    const allowedRecipients = this.config.BLOOM_ALLOW_TRANSFER_TO;
+    if (allowedRecipients.length === 0) return true;
+    const toAddress = String(intent.to_address ?? "").trim().toLowerCase();
+    if (!toAddress) return false;
+    return allowedRecipients.includes(toAddress);
+  }
+
   private async evaluateConstraints(input: {
     agentId: string;
     userId: string;
@@ -397,10 +420,15 @@ export class Kernel {
 
     const policy = this.getPolicy(input.agentId, input.userId);
     const intentType = getIntentType(input.intent);
+    const driver = this.getIntentDriver(intentType);
+    let driverRequiresStepUp: boolean | undefined;
     if (policy.blocklist.includes(intentType)) {
       return { allowed: false, reason: "blocked_intent" };
     }
-    if (policy.allowlist.length > 0 && !policy.allowlist.includes(intentType)) {
+    if (intentType === "usdc_transfer" && !this.isUsdcTransferAllowlisted(input.agentId, input.intent)) {
+      return { allowed: false, reason: "intent_not_allowlisted" };
+    }
+    if (!driver && intentType !== "usdc_transfer" && policy.allowlist.length > 0 && !policy.allowlist.includes(intentType)) {
       return { allowed: false, reason: "intent_not_allowlisted" };
     }
 
@@ -409,6 +437,29 @@ export class Kernel {
     const maxPerDay = policy.per_intent_limit[intentType]?.max_per_day;
     if (maxPerDay !== undefined && countToday >= maxPerDay) {
       return { allowed: false, reason: "per_intent_limit_reached" };
+    }
+
+    if (driver?.preConstraints) {
+      const driverDecision = await driver.preConstraints({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        env: this.env,
+        agentId: input.agentId,
+        userId: input.userId,
+        intent: input.intent,
+        intentType
+      } satisfies DriverPreConstraintsContext);
+      if (!driverDecision.allowed) {
+        const spendPayload = driverDecision.spend_power
+          ? { spend_power: driverDecision.spend_power as SpendPowerSnapshot }
+          : {};
+        const factsPayload = driverDecision.facts_snapshot ? { facts_snapshot: driverDecision.facts_snapshot } : {};
+        return { allowed: false, reason: driverDecision.reason, ...spendPayload, ...factsPayload };
+      }
+      if (driverDecision.requires_step_up !== undefined) {
+        driverRequiresStepUp = driverDecision.requires_step_up;
+      }
     }
 
     const budget = this.db
@@ -469,6 +520,34 @@ export class Kernel {
         ...(spendPowerBase ? { spend_power: spendPowerBase } : {}),
         facts_snapshot: factsSnapshotBase
       };
+    }
+
+    if (driver?.postBudgetConstraints) {
+      const driverDecision = await driver.postBudgetConstraints({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        env: this.env,
+        agentId: input.agentId,
+        userId: input.userId,
+        intent: input.intent,
+        intentType,
+        budget,
+        policySpendableCents,
+        reservedOutgoingCents,
+        reservedHoldsCents,
+        factsSnapshotBase
+      } satisfies DriverBudgetContext);
+      if (!driverDecision.allowed) {
+        const spendPayload = driverDecision.spend_power
+          ? { spend_power: driverDecision.spend_power as SpendPowerSnapshot }
+          : {};
+        const factsPayload = driverDecision.facts_snapshot ? { facts_snapshot: driverDecision.facts_snapshot } : {};
+        return { allowed: false, reason: driverDecision.reason, ...spendPayload, ...factsPayload };
+      }
+      if (driverDecision.requires_step_up !== undefined) {
+        driverRequiresStepUp = driverDecision.requires_step_up;
+      }
     }
 
     if (!options.skipFreshness) {
@@ -556,8 +635,11 @@ export class Kernel {
     }
 
     const stepUpThreshold = policy.step_up_threshold.spend_cents ?? 1000000;
-    const requiresStepUp =
+    let requiresStepUp =
       baseCost >= stepUpThreshold || (this.env.envName === "base_usdc" && intentType === "usdc_transfer");
+    if (driverRequiresStepUp !== undefined) {
+      requiresStepUp = driverRequiresStepUp;
+    }
     return {
       allowed: true,
       reason: "ok",
@@ -590,7 +672,18 @@ export class Kernel {
 
     let intent = input.intent_json;
     let normalizationError: string | null = null;
-    if (this.env.envName === "base_usdc" && getIntentType(intent) === "usdc_transfer") {
+    const intentType = getIntentType(intent);
+    const driver = this.getIntentDriver(intentType);
+    if (driver?.normalizeIntent) {
+      const normalized = driver.normalizeIntent(intent);
+      if (normalized.ok) {
+        intent = normalized.intent;
+      } else {
+        normalizationError = normalized.reason;
+      }
+    }
+
+    if (!normalizationError && this.env.envName === "base_usdc" && getIntentType(intent) === "usdc_transfer") {
       const normalized = normalizeUsdcTransferIntent(intent);
       if (normalized.ok) {
         intent = normalized.intent;
@@ -1069,7 +1162,20 @@ export class Kernel {
     });
 
     const intent = parseJson<Record<string, unknown>>(quote.intentJson, {});
-    if (this.env.envName === "base_usdc" && getIntentType(intent) === "usdc_transfer") {
+    const intentType = getIntentType(intent);
+    const driver = this.getIntentDriver(intentType);
+    if (driver?.execute) {
+      return await driver.execute({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        env: this.env,
+        quote,
+        intent,
+        input
+      });
+    }
+    if (this.env.envName === "base_usdc" && intentType === "usdc_transfer") {
       return this.executeBaseUsdcTransfer({
         quote,
         decision,
