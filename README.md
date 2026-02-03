@@ -79,9 +79,22 @@ curl -s 'http://localhost:3000/api/ui/activity?agent_id=AGENT_ID&mode=full' \
   -H 'x-api-key: READ_API_KEY'
 ```
 
+## Dashboard (Read-only)
+
+The minimal dashboard lives in `web/` and mirrors the “big number” UX semantics.
+
+Run locally
+- `pnpm dev` (API)
+- `pnpm -C web install` (first time only)
+- `pnpm web:dev`
+- `pnpm dev:all` (API + web)
+
+Local auth note: the Vite dev server proxies `/api` to the backend. If you export `BLOOM_READ_KEY`, it will be injected as the `x-api-key` header for UI calls.
+
 Not in contract
 - Client SDKs, CLI tooling, or example apps.
-- The approval UI or any other web UI.
+- Trading/write controls in the dashboard (read-only only in Phase 1).
+- The approval UI (still separate from the dashboard).
 - Provider-specific payload shapes (e.g., Base USDC receipts or card metadata beyond declared fields).
 - Internal DB schemas, migrations, or log formatting.
 

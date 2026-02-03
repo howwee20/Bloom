@@ -139,12 +139,31 @@ describe("UI endpoints", () => {
     });
     expect(res.statusCode).toBe(200);
 
-    const body = res.json() as Record<string, unknown>;
+    const body = res.json() as {
+      number: string;
+      balance: string;
+      held: string;
+      net_worth: string;
+      updated: string;
+      bot_running: boolean;
+      trading_enabled: boolean;
+      next_tick_at: number | null;
+      last_tick_at: number | null;
+      details: {
+        spendable_cents: number;
+        balance_cents: number;
+        held_cents: number;
+      };
+    };
     expect(body.number).toBe("$6.00");
     expect(body.balance).toBe("$8.00 balance");
     expect(body.held).toBe("$2.00 held");
     expect(body.net_worth).toBe("$8.00");
     expect(body.updated).toBe("just now");
+    expect(body.bot_running).toBe(false);
+    expect(body.trading_enabled).toBe(false);
+    expect(body.next_tick_at).toBeNull();
+    expect(body.last_tick_at).toBeNull();
     expect(body.details).toEqual({
       spendable_cents: 600,
       balance_cents: 800,
@@ -156,7 +175,7 @@ describe("UI endpoints", () => {
   });
 
   it("collapses receipts into ui/activity glance and summary", async () => {
-    const { app, db, kernel } = await createApp();
+    const { app, db, sqlite, kernel } = await createApp();
     const { agent_id, user_id } = kernel.createAgent({ userId: "user_ui", agentId: "agent_ui" });
 
     const keyRes = await app.inject({
@@ -168,30 +187,44 @@ describe("UI endpoints", () => {
     const apiKey = (keyRes.json() as { api_key: string }).api_key;
 
     const base = nowSeconds();
+    const withQuoteEvent = (type: string, occurredAt: number) =>
+      appendEvent(db, sqlite, {
+        agentId: agent_id,
+        userId: user_id,
+        type,
+        payload: { quote_id: "quote_ui" },
+        occurredAt
+      });
+    const approvedEvent = withQuoteEvent("policy_approved", base - 3);
     createReceipt(db, {
       agentId: agent_id,
       userId: user_id,
       source: "policy",
+      eventId: approvedEvent.event_id,
       externalRef: "quote_ui",
       whatHappened: "Policy approved intent.",
       whyChanged: "constraints_ok",
       whatHappensNext: "Quote issued.",
       occurredAt: base - 3
     });
+    const reserveEvent = withQuoteEvent("budget_reserved", base - 2);
     createReceipt(db, {
       agentId: agent_id,
       userId: user_id,
       source: "execution",
+      eventId: reserveEvent.event_id,
       externalRef: "quote_ui",
       whatHappened: "Budget reserved for execution.",
       whyChanged: "reserve",
       whatHappensNext: "Environment action will apply.",
       occurredAt: base - 2
     });
+    const envEvent = withQuoteEvent("env_action", base - 1);
     createReceipt(db, {
       agentId: agent_id,
       userId: user_id,
       source: "env",
+      eventId: envEvent.event_id,
       externalRef: "quote_ui",
       whatHappened:
         "USDC transfer broadcast. tx_hash=0x352f000000000000000000000000000000000000000000000000000000000000 amount_cents=100 to_address=0x56B0e5Ce4f03a82B5e46ACaE4e93e49Ada453351 observation_unknown",
@@ -199,10 +232,12 @@ describe("UI endpoints", () => {
       whatHappensNext: "Pending confirmation.",
       occurredAt: base - 1
     });
+    const execEvent = withQuoteEvent("execution_applied", base);
     createReceipt(db, {
       agentId: agent_id,
       userId: user_id,
       source: "execution",
+      eventId: execEvent.event_id,
       externalRef: "quote_ui",
       whatHappened: "Execution applied.",
       whyChanged: "applied",
@@ -303,6 +338,246 @@ describe("UI endpoints", () => {
     expect(item.id).toBe("quote_ui");
     expect(item.summary.some((entry) => entry.startsWith("Needs approval"))).toBe(true);
     expect(item.summary.some((entry) => entry.startsWith("Pending"))).toBe(true);
+
+    await app.close();
+  });
+
+  it("does not duplicate approval-only rows when grouped by quote_id", async () => {
+    const { app, db, sqlite, kernel } = await createApp();
+    const { agent_id, user_id } = kernel.createAgent({ userId: "user_ui", agentId: "agent_ui" });
+
+    const keyRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/keys",
+      headers: { "x-admin-key": "adminkey" },
+      payload: { user_id: "user_ui", scopes: ["read"] }
+    });
+    const apiKey = (keyRes.json() as { api_key: string }).api_key;
+
+    const base = nowSeconds();
+    const approvedEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "policy_approved",
+      payload: { quote_id: "quote_orphan" },
+      occurredAt: base - 1
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "policy",
+      eventId: approvedEvent.event_id,
+      externalRef: "quote_orphan",
+      whatHappened: "Policy approved intent.",
+      whyChanged: "constraints_ok",
+      whatHappensNext: "Quote issued.",
+      occurredAt: base - 1
+    });
+
+    const envEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "env_action",
+      payload: { quote_id: "quote_orphan" },
+      occurredAt: base
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "env",
+      eventId: envEvent.event_id,
+      externalRef: "quote_orphan",
+      whatHappened:
+        "USDC transfer broadcast. tx_hash=0xabc1230000000000000000000000000000000000000000000000000000000000 amount_cents=200 to_address=0x1111111111111111111111111111111111111111 observation_unknown",
+      whyChanged: "applied",
+      whatHappensNext: "Pending confirmation.",
+      occurredAt: base
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/ui/activity?agent_id=${agent_id}&limit=5`,
+      headers: { "x-api-key": apiKey }
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as Array<{ summary: string[] }>;
+    expect(body.length).toBe(1);
+    expect(body[0].summary.some((entry) => entry.startsWith("Approved"))).toBe(true);
+    expect(body[0].summary.some((entry) => entry.startsWith("Sent"))).toBe(true);
+
+    await app.close();
+  });
+
+  it("orders ui/activity deterministically for equal timestamps", async () => {
+    const { app, db, sqlite, kernel } = await createApp();
+    const { agent_id, user_id } = kernel.createAgent({ userId: "user_ui", agentId: "agent_ui" });
+
+    const keyRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/keys",
+      headers: { "x-admin-key": "adminkey" },
+      payload: { user_id: "user_ui", scopes: ["read"] }
+    });
+    const apiKey = (keyRes.json() as { api_key: string }).api_key;
+
+    const base = nowSeconds();
+    const eventA = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "policy_approved",
+      payload: { quote_id: "quote_a" },
+      occurredAt: base
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "policy",
+      eventId: eventA.event_id,
+      externalRef: "quote_a",
+      whatHappened: "Policy approved intent.",
+      whyChanged: "constraints_ok",
+      whatHappensNext: "Quote issued.",
+      occurredAt: base
+    });
+
+    const eventB = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "policy_approved",
+      payload: { quote_id: "quote_b" },
+      occurredAt: base
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "policy",
+      eventId: eventB.event_id,
+      externalRef: "quote_b",
+      whatHappened: "Policy approved intent.",
+      whyChanged: "constraints_ok",
+      whatHappensNext: "Quote issued.",
+      occurredAt: base
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/ui/activity?agent_id=${agent_id}&limit=5`,
+      headers: { "x-api-key": apiKey }
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as Array<{ id: string }>;
+    expect(body.map((item) => item.id)).toEqual(["quote_a", "quote_b"]);
+
+    await app.close();
+  });
+
+  it("groups polymarket events by quote_id", async () => {
+    const { app, db, sqlite, kernel } = await createApp();
+    const { agent_id, user_id } = kernel.createAgent({ userId: "user_ui", agentId: "agent_ui" });
+
+    const keyRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/keys",
+      headers: { "x-admin-key": "adminkey" },
+      payload: { user_id: "user_ui", scopes: ["read"] }
+    });
+    const apiKey = (keyRes.json() as { api_key: string }).api_key;
+
+    const base = nowSeconds();
+    const quoteId = "quote_poly";
+    const orderId = "order_poly";
+
+    const postedEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "polymarket_order_posted",
+      payload: { quote_id: quoteId, order_id: orderId },
+      occurredAt: base - 3
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "execution",
+      eventId: postedEvent.event_id,
+      externalRef: orderId,
+      whatHappened: "Order posted.",
+      whyChanged: "order_posted",
+      whatHappensNext: "Order is open.",
+      occurredAt: base - 3
+    });
+
+    const holdEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "polymarket_hold_created",
+      payload: { quote_id: quoteId, order_id: orderId },
+      occurredAt: base - 2
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "execution",
+      eventId: holdEvent.event_id,
+      externalRef: orderId,
+      whatHappened: "Hold created. amount_cents=250",
+      whyChanged: "hold_created",
+      whatHappensNext: "Capital is reserved.",
+      occurredAt: base - 2
+    });
+
+    const canceledEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "polymarket_order_canceled",
+      payload: { quote_id: quoteId, order_id: orderId },
+      occurredAt: base - 1
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "execution",
+      eventId: canceledEvent.event_id,
+      externalRef: orderId,
+      whatHappened: "Order canceled.",
+      whyChanged: "order_canceled",
+      whatHappensNext: "Order is closed.",
+      occurredAt: base - 1
+    });
+
+    const releasedEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "polymarket_hold_released",
+      payload: { quote_id: quoteId, order_id: orderId },
+      occurredAt: base
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "execution",
+      eventId: releasedEvent.event_id,
+      externalRef: orderId,
+      whatHappened: "Hold released. amount_cents=250",
+      whyChanged: "hold_released",
+      whatHappensNext: "Capital is available.",
+      occurredAt: base
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/ui/activity?agent_id=${agent_id}&limit=10`,
+      headers: { "x-api-key": apiKey }
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as Array<{ id: string; summary: string[] }>;
+    expect(body.length).toBe(1);
+    expect(body[0].id).toBe(quoteId);
+    expect(body[0].summary.some((entry) => entry.startsWith("Held"))).toBe(true);
+    expect(body[0].summary.some((entry) => entry.startsWith("Released"))).toBe(true);
+    expect(body[0].summary.some((entry) => entry.startsWith("Canceled"))).toBe(true);
 
     await app.close();
   });

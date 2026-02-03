@@ -17,6 +17,7 @@ import {
   apiKeys,
   budgets,
   cardHolds,
+  executions,
   events,
   policies,
   quotes,
@@ -92,6 +93,20 @@ function parseJson<T>(value: unknown, fallback: T): T {
     }
   }
   return value as T;
+}
+
+const TX_HASH_REGEX = /tx_hash=([0-9a-fA-Fx]+)/;
+
+function extractTxHash(what: string | null | undefined) {
+  if (!what) return undefined;
+  const match = TX_HASH_REGEX.exec(what);
+  return match?.[1];
+}
+
+function normalizeQuoteId(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 function normalizeTransferIntentType(intent: Record<string, unknown>) {
@@ -675,6 +690,11 @@ export function buildServer(options: {
     const spendableCents = snapshot?.effectiveSpendPowerCents ?? 0;
     const updatedAt = snapshot?.updatedAt ?? nowSeconds();
     const now = nowSeconds();
+    const botStatus = config.POLY_MODE === "real" ? polymarketBot.status() : polymarketDryrunBot.status();
+    const botRunning = botStatus.running;
+    const tradingEnabled = config.POLY_MODE === "real" ? botStatus.trading_enabled : false;
+    const nextTickAt = botStatus.next_tick_at;
+    const lastTickAt = botStatus.last_tick_at;
 
     return reply.send({
       agent_id: query.agent_id,
@@ -683,6 +703,10 @@ export function buildServer(options: {
       held: `${formatMoney(heldCents)} held`,
       net_worth: formatMoney(balanceCents),
       updated: formatUpdated(updatedAt, now),
+      bot_running: botRunning,
+      trading_enabled: tradingEnabled,
+      next_tick_at: nextTickAt,
+      last_tick_at: lastTickAt,
       details: {
         spendable_cents: spendableCents,
         balance_cents: balanceCents,
@@ -722,19 +746,48 @@ export function buildServer(options: {
       const eventRows = db.select().from(events).where(inArray(events.eventId, eventIds)).all();
       for (const event of eventRows) {
         const payload = parseJson<Record<string, unknown>>(event.payloadJson, {});
-        const quoteId = (payload as { quote_id?: unknown }).quote_id;
-        if (typeof quoteId === "string" && quoteId.length > 0) {
+        const quoteId = normalizeQuoteId((payload as { quote_id?: unknown }).quote_id);
+        if (quoteId) {
           quoteIdByEvent.set(event.eventId, quoteId);
         }
       }
     }
 
-    type ReceiptWithGroupKey = (typeof receipts.$inferSelect) & { groupKey?: string };
-    const rowsWithGroupKey: ReceiptWithGroupKey[] = rows.map((row) => {
-      const quoteId = row.eventId ? quoteIdByEvent.get(row.eventId) : undefined;
-      if (quoteId) return { ...row, groupKey: quoteId };
-      if (row.externalRef) return { ...row, groupKey: row.externalRef };
-      return row;
+    const externalRefs = rows.map((row) => row.externalRef).filter((ref): ref is string => Boolean(ref));
+    const quoteIdByExternalRef = new Map<string, string>();
+    if (externalRefs.length > 0) {
+      const quoteRows = db.select().from(quotes).where(inArray(quotes.quoteId, externalRefs)).all();
+      for (const quote of quoteRows) {
+        quoteIdByExternalRef.set(quote.quoteId, quote.quoteId);
+      }
+      const executionRows = db.select().from(executions).where(inArray(executions.externalRef, externalRefs)).all();
+      for (const execution of executionRows) {
+        if (execution.externalRef) {
+          quoteIdByExternalRef.set(execution.externalRef, execution.quoteId);
+        }
+      }
+    }
+
+    const enriched = rows.map((row) => {
+      const txHash = extractTxHash(row.whatHappened);
+      const quoteId =
+        (row.eventId ? quoteIdByEvent.get(row.eventId) : undefined) ??
+        (row.externalRef ? quoteIdByExternalRef.get(row.externalRef) : undefined);
+      return { row, txHash, quoteId };
+    });
+
+    const txHashByQuoteId = new Map<string, string>();
+    for (const entry of enriched) {
+      if (entry.txHash && entry.quoteId) {
+        txHashByQuoteId.set(entry.quoteId, entry.txHash);
+      }
+    }
+
+    type ReceiptWithGroupKey = (typeof receipts.$inferSelect) & { groupKey?: string; quoteId?: string | null };
+    const rowsWithGroupKey: ReceiptWithGroupKey[] = enriched.map(({ row, txHash, quoteId }) => {
+      const mappedTxHash = quoteId ? txHashByQuoteId.get(quoteId) : undefined;
+      const groupKey = txHash ?? mappedTxHash ?? quoteId ?? row.receiptId;
+      return { ...row, groupKey, quoteId: quoteId ?? null };
     });
 
     const activity = buildUiActivity(rowsWithGroupKey, { limit: bounded, nowSeconds: nowSeconds() });

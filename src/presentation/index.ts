@@ -6,6 +6,7 @@ type ReceiptRow = {
   eventId: string | null;
   externalRef: string | null;
   groupKey?: string | null;
+  quoteId?: string | null;
   whatHappened: string;
   whyChanged: string;
   whatHappensNext: string;
@@ -42,6 +43,7 @@ export type HumanStep = {
 
 export type TransactionRollup = {
   id: string;
+  quote_id?: string;
   status: "pending" | "confirmed" | "declined";
   headline: string;
   steps: HumanStep[];
@@ -318,21 +320,9 @@ export function mapReceiptToHumanStep(receipt: ReceiptRow): HumanStep | null {
 }
 
 function groupReceipts(receipts: ReceiptRow[]) {
-  const txHashByGroup = new Map<string, string>();
-  for (const receipt of receipts) {
-    const txHash = extractTxHash(receipt.whatHappened ?? "");
-    const groupKey = receipt.groupKey ?? undefined;
-    if (txHash && groupKey) {
-      txHashByGroup.set(groupKey, txHash);
-    }
-  }
-
   const groups = new Map<string, ReceiptRow[]>();
   for (const receipt of receipts) {
-    const txHash = extractTxHash(receipt.whatHappened ?? "");
-    const groupKey = receipt.groupKey ?? undefined;
-    const mapped = groupKey ? txHashByGroup.get(groupKey) : undefined;
-    const key = txHash ?? mapped ?? groupKey ?? receipt.externalRef ?? receipt.receiptId;
+    const key = receipt.groupKey ?? receipt.receiptId;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)?.push(receipt);
   }
@@ -408,6 +398,11 @@ export function rollupTransactionByExternalRef(
 ): TransactionRollup | null {
   if (!receipts.length) return null;
   const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000);
+  const quoteId = receipts.reduce<string | undefined>((acc, receipt) => {
+    if (acc) return acc;
+    const id = receipt.quoteId ?? undefined;
+    return id ?? acc;
+  }, undefined);
   const hasStepUpToken = receipts.some((receipt) => receipt.whatHappened?.startsWith("Step-up token accepted."));
 
   let steps = receipts
@@ -465,6 +460,7 @@ export function rollupTransactionByExternalRef(
 
   return {
     id: externalRef,
+    quote_id: quoteId,
     status,
     headline,
     steps: deduped,
@@ -503,19 +499,24 @@ export function buildUiActivity(receipts: ReceiptRow[], options: { limit?: numbe
     return true;
   };
 
-  const suppressWindowSeconds = 5 * 60;
+  const nonApprovalQuoteIds = new Set(
+    rollups
+      .filter((rollup) => !isApprovalOnly(rollup))
+      .map((rollup) => rollup.quote_id)
+      .filter((value): value is string => Boolean(value))
+  );
+
   const filtered = rollups.filter((rollup) => {
     if (!isApprovalOnly(rollup)) return true;
-    const hasNearbyFull = rollups.some(
-      (other) =>
-        other !== rollup &&
-        !isApprovalOnly(other) &&
-        Math.abs(other.time - rollup.time) <= suppressWindowSeconds
-    );
-    return !hasNearbyFull;
+    if (rollup.quote_id && nonApprovalQuoteIds.has(rollup.quote_id)) return false;
+    return true;
   });
 
-  filtered.sort((a, b) => b.time - a.time);
+  filtered.sort((a, b) => {
+    if (a.time !== b.time) return b.time - a.time;
+    if (a.id === b.id) return 0;
+    return a.id < b.id ? -1 : 1;
+  });
   const limit = options.limit ? Math.max(1, Math.floor(options.limit)) : filtered.length;
   const trimmed = filtered.slice(0, limit);
 
