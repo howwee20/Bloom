@@ -35,6 +35,30 @@ export type Config = {
   POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: number;
   POLY_DRYRUN_MAX_OPEN_ORDERS: number;
   POLY_DRYRUN_LOOP_SECONDS: number;
+  POLY_MODE: "dryrun" | "real";
+  POLY_CLOB_HOST: string;
+  POLY_GAMMA_HOST: string;
+  POLY_DATA_HOST: string;
+  POLY_CHAIN_ID: number;
+  POLY_PRIVATE_KEY: string | null;
+  POLY_API_KEY: string | null;
+  POLY_API_SECRET: string | null;
+  POLY_API_PASSPHRASE: string | null;
+  POLY_BOT_AGENT_ID: string;
+  POLY_BOT_LOOP_SECONDS: number;
+  POLY_BOT_TRADING_ENABLED: boolean;
+  // Phase 4: Trading gate limits (real mode)
+  POLY_MAX_PER_ORDER_CENTS: number;
+  POLY_MAX_PER_DAY_CENTS: number;
+  POLY_MAX_OPEN_HOLDS_CENTS: number;
+  POLY_MAX_OPEN_ORDERS: number;
+  // Phase 4: Bot trading config
+  POLY_TRADE_TOKEN_ID: string | null;
+  POLY_TRADE_PRICE: number | null;
+  POLY_TRADE_SIZE: number | null;
+  POLY_MIN_SECONDS_BETWEEN_TRADES: number;
+  POLY_TRADE_AUTO_APPROVE: boolean;
+  POLY_TRADE_MARKET_SLUG: string | null;
 };
 
 function isRunningInDocker() {
@@ -81,7 +105,7 @@ export function getConfig(): Config {
     BIND_APPROVAL_UI: env.BIND_APPROVAL_UI === "true",
     CARD_MODE: env.CARD_MODE === "shadow" ? "shadow" : env.CARD_MODE === "enforce" ? "enforce" : "dev",
     CARD_WEBHOOK_SHARED_SECRET: env.CARD_WEBHOOK_SHARED_SECRET ?? null,
-    ADMIN_API_KEY: env.ADMIN_API_KEY ?? null,
+    ADMIN_API_KEY: env.ADMIN_API_KEY ?? env.BLOOM_ADMIN_KEY ?? null,
     ENV_TYPE: env.ENV_TYPE === "base_usdc" ? "base_usdc" : "simple_economy",
     ENV_STALE_SECONDS: env.ENV_STALE_SECONDS ? Number(env.ENV_STALE_SECONDS) : 60,
     ENV_UNKNOWN_SECONDS: env.ENV_UNKNOWN_SECONDS ? Number(env.ENV_UNKNOWN_SECONDS) : 300,
@@ -113,6 +137,32 @@ export function getConfig(): Config {
       ? Number(env.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS)
       : 2000,
     POLY_DRYRUN_MAX_OPEN_ORDERS: env.POLY_DRYRUN_MAX_OPEN_ORDERS ? Number(env.POLY_DRYRUN_MAX_OPEN_ORDERS) : 20,
-    POLY_DRYRUN_LOOP_SECONDS: env.POLY_DRYRUN_LOOP_SECONDS ? Number(env.POLY_DRYRUN_LOOP_SECONDS) : 30
+    POLY_DRYRUN_LOOP_SECONDS: env.POLY_DRYRUN_LOOP_SECONDS ? Number(env.POLY_DRYRUN_LOOP_SECONDS) : 30,
+    POLY_MODE: env.POLY_MODE === "real" ? "real" : "dryrun",
+    POLY_CLOB_HOST: env.POLY_CLOB_HOST ?? "https://clob.polymarket.com",
+    POLY_GAMMA_HOST: env.POLY_GAMMA_HOST ?? "https://gamma-api.polymarket.com",
+    POLY_DATA_HOST: env.POLY_DATA_HOST ?? "https://data-api.polymarket.com",
+    POLY_CHAIN_ID: env.POLY_CHAIN_ID ? Number(env.POLY_CHAIN_ID) : 137,
+    POLY_PRIVATE_KEY: env.POLY_PRIVATE_KEY ?? null,
+    POLY_API_KEY: env.POLY_API_KEY ?? null,
+    POLY_API_SECRET: env.POLY_API_SECRET ?? null,
+    POLY_API_PASSPHRASE: env.POLY_API_PASSPHRASE ?? null,
+    POLY_BOT_AGENT_ID: env.POLY_BOT_AGENT_ID ?? "agent_ej",
+    POLY_BOT_LOOP_SECONDS: env.POLY_BOT_LOOP_SECONDS ? Number(env.POLY_BOT_LOOP_SECONDS) : 60,
+    POLY_BOT_TRADING_ENABLED: env.POLY_BOT_TRADING_ENABLED === "true",
+    // Phase 4: Trading gate limits (real mode) - safe defaults
+    POLY_MAX_PER_ORDER_CENTS: env.POLY_MAX_PER_ORDER_CENTS ? Number(env.POLY_MAX_PER_ORDER_CENTS) : 10,
+    POLY_MAX_PER_DAY_CENTS: env.POLY_MAX_PER_DAY_CENTS ? Number(env.POLY_MAX_PER_DAY_CENTS) : 0, // 0 = disabled
+    POLY_MAX_OPEN_HOLDS_CENTS: env.POLY_MAX_OPEN_HOLDS_CENTS ? Number(env.POLY_MAX_OPEN_HOLDS_CENTS) : 20,
+    POLY_MAX_OPEN_ORDERS: env.POLY_MAX_OPEN_ORDERS ? Number(env.POLY_MAX_OPEN_ORDERS) : 5,
+    // Phase 4: Bot trading config
+    POLY_TRADE_TOKEN_ID: env.POLY_TRADE_TOKEN_ID ?? null,
+    POLY_TRADE_PRICE: env.POLY_TRADE_PRICE ? Number(env.POLY_TRADE_PRICE) : null,
+    POLY_TRADE_SIZE: env.POLY_TRADE_SIZE ? Number(env.POLY_TRADE_SIZE) : null,
+    POLY_MIN_SECONDS_BETWEEN_TRADES: env.POLY_MIN_SECONDS_BETWEEN_TRADES
+      ? Number(env.POLY_MIN_SECONDS_BETWEEN_TRADES)
+      : 3600,
+    POLY_TRADE_AUTO_APPROVE: env.POLY_TRADE_AUTO_APPROVE === "true",
+    POLY_TRADE_MARKET_SLUG: env.POLY_TRADE_MARKET_SLUG ?? null
   };
 }

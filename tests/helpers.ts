@@ -53,7 +53,19 @@ export function createTestContext(overrides: Partial<Config> = {}) {
     POLY_DRYRUN_MAX_PER_ORDER_CENTS: overrides.POLY_DRYRUN_MAX_PER_ORDER_CENTS ?? 500,
     POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: overrides.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS ?? 2000,
     POLY_DRYRUN_MAX_OPEN_ORDERS: overrides.POLY_DRYRUN_MAX_OPEN_ORDERS ?? 20,
-    POLY_DRYRUN_LOOP_SECONDS: overrides.POLY_DRYRUN_LOOP_SECONDS ?? 30
+    POLY_DRYRUN_LOOP_SECONDS: overrides.POLY_DRYRUN_LOOP_SECONDS ?? 30,
+    POLY_MODE: overrides.POLY_MODE ?? "dryrun",
+    POLY_CLOB_HOST: overrides.POLY_CLOB_HOST ?? "https://clob.polymarket.com",
+    POLY_GAMMA_HOST: overrides.POLY_GAMMA_HOST ?? "https://gamma-api.polymarket.com",
+    POLY_DATA_HOST: overrides.POLY_DATA_HOST ?? "https://data-api.polymarket.com",
+    POLY_CHAIN_ID: overrides.POLY_CHAIN_ID ?? 137,
+    POLY_PRIVATE_KEY: overrides.POLY_PRIVATE_KEY ?? null,
+    POLY_API_KEY: overrides.POLY_API_KEY ?? null,
+    POLY_API_SECRET: overrides.POLY_API_SECRET ?? null,
+    POLY_API_PASSPHRASE: overrides.POLY_API_PASSPHRASE ?? null,
+    POLY_BOT_AGENT_ID: "agent_ej",
+    POLY_BOT_LOOP_SECONDS: 60,
+    POLY_BOT_TRADING_ENABLED: false,
   };
   const env = new SimpleEconomyWorld(db, sqlite, config);
   const kernel = new Kernel(db, sqlite, env, config, [new PolymarketDryrunDriver()]);

@@ -202,6 +202,7 @@ pnpm dev
 - `BLOOM_BASE_URL` (MCP server base URL)
 - `BLOOM_READ_KEY` (MCP read-only key)
 - `BLOOM_PROPOSE_KEY` (MCP propose-only key)
+- `BLOOM_EXECUTE_KEY` (optional MCP execute-only key)
 
 **Dev transfer allowlist**
 
@@ -262,11 +263,88 @@ Bot start/stop requires `BLOOM_ADMIN_KEY` in the MCP server environment.
 **CLI**
 
 ```bash
-pnpm polymarket:dryrun --agent agent_ej --market "test_market" --token "YES_123" --price 0.42 --size 10
+pnpm polymarket:dryrun --agent agent_ej --market "test_market" --token "YES_123" --price 0.42 --size 10 --client_order_id demo_1
+pnpm polymarket:cancel --agent agent_ej --order_id ORDER_ID
 ```
 
-The CLI uses `BLOOM_PROPOSE_KEY` for `/api/can_do`, `BLOOM_EXECUTE_KEY` for `/api/execute`, and `BLOOM_READ_KEY` to
-print `reserved_holds_cents` when available.
+The CLIs use `BLOOM_PROPOSE_KEY` for `/api/can_do` and `BLOOM_EXECUTE_KEY` for `/api/execute` (they fall back to
+`BLOOM_PROPOSE_KEY` if it has execute scope).
+
+## Polymarket driver (Phase 2 real mode)
+
+Phase 2 enables real Polymarket CLOB placement/cancel while keeping Phase 1 semantics (holds + receipts + UI rollup).
+It **does not** include a trading bot yet.
+
+**Required env vars (real mode)**
+
+```bash
+export POLY_MODE=real
+export POLY_CLOB_HOST=https://clob.polymarket.com
+export POLY_GAMMA_HOST=https://gamma-api.polymarket.com
+export POLY_DATA_HOST=https://data-api.polymarket.com
+export POLY_CHAIN_ID=137
+export POLY_PRIVATE_KEY=YOUR_L1_PRIVATE_KEY
+```
+
+Optional (cache L2 creds; if absent they are derived via `createOrDeriveApiKey`):
+```bash
+export POLY_API_KEY=
+export POLY_API_SECRET=
+export POLY_API_PASSPHRASE=
+```
+
+**Worker**
+
+```bash
+pnpm worker:polymarket
+```
+
+**Manual test (real mode)**
+
+```bash
+pnpm dev
+pnpm worker:polymarket
+pnpm polymarket:dryrun --agent agent_ej --market "test_market" --token "YES_123" --price 0.42 --size 10
+pnpm polymarket:cancel --agent agent_ej --order_id ORDER_ID
+```
+
+Verify UI state:
+
+```bash
+curl -s -H "X-Api-Key: $BLOOM_READ_KEY" "http://localhost:3000/api/ui/state?agent_id=agent_ej"
+curl -s -H "X-Api-Key: $BLOOM_READ_KEY" "http://localhost:3000/api/ui/activity?agent_id=agent_ej&limit=10"
+```
+
+Security: `POLY_PRIVATE_KEY` is sensitive. Do not log it or commit it.
+
+## Polymarket bot (Phase 2.5 observe-only)
+
+The observe-only bot polls Gamma active markets and emits one receipt per tick. It does **not** trade.
+
+**Env vars**
+
+```bash
+export POLY_BOT_AGENT_ID=agent_ej
+export POLY_BOT_LOOP_SECONDS=60
+export POLY_BOT_TRADING_ENABLED=false
+```
+
+**Endpoints**
+
+```bash
+curl -s -X POST http://localhost:3000/api/bots/polymarket/start \
+  -H 'content-type: application/json' \
+  -H "x-admin-key: $BLOOM_ADMIN_KEY" \
+  -d '{"agent_id":"agent_ej"}'
+
+curl -s http://localhost:3000/api/bots/polymarket/status \
+  -H "x-api-key: $BLOOM_READ_KEY"
+
+curl -s -X POST http://localhost:3000/api/bots/polymarket/stop \
+  -H 'content-type: application/json' \
+  -H "x-admin-key: $BLOOM_ADMIN_KEY" \
+  -d '{}'
+```
 
 ## API examples
 
@@ -361,7 +439,8 @@ curl -s -X POST http://localhost:3000/api/card/auth \
 
 ## Claude Desktop MCP Quickstart
 
-The MCP server enables Claude Desktop to read agent state and propose actions. By design, **Claude cannot execute transactions** - humans approve out-of-band.
+The MCP server enables Claude Desktop to read agent state and propose actions. Execute tools are **optional** and require a
+separate execute-scoped key.
 
 ### Available MCP Tools
 
@@ -372,13 +451,18 @@ The MCP server enables Claude Desktop to read agent state and propose actions. B
 | `bloom_get_state` | Fetch raw state and observation (full audit) | read |
 | `bloom_list_receipts` | List raw receipts (full audit) | read |
 | `bloom_can_do` | Request a quote (propose only) | propose |
+| `bloom_polymarket_place_order` | Place a real Polymarket BUY order | execute |
+| `bloom_polymarket_cancel_order` | Cancel a real Polymarket order | execute |
+| `bloom_polymarket_reconcile_now` | Run one Polymarket reconciliation cycle | admin |
+| `bloom_polymarket_bot_start` | Start the observe-only Polymarket bot | admin |
+| `bloom_polymarket_bot_stop` | Stop the observe-only Polymarket bot | admin |
+| `bloom_polymarket_bot_status` | Get status for the Polymarket bot | read |
 
-
-No `execute` tool is exposed. This is intentional.
+Execute tools are only enabled when `BLOOM_EXECUTE_KEY` is set.
 
 ### Step 1: Create Scoped API Keys
 
-The MCP server requires two separate keys with minimal scopes:
+The MCP server requires separate keys with minimal scopes:
 
 ```bash
 # Create read-only key
@@ -392,6 +476,12 @@ curl -s -X POST http://localhost:3000/api/admin/keys \
   -H 'content-type: application/json' \
   -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
   -d '{"user_id":"mcp_user","scopes":["propose"]}'
+
+# Optional: create execute-only key (required for real Polymarket place/cancel)
+curl -s -X POST http://localhost:3000/api/admin/keys \
+  -H 'content-type: application/json' \
+  -H 'x-admin-key: YOUR_ADMIN_API_KEY' \
+  -d '{"user_id":"mcp_user","scopes":["execute"]}'
 ```
 
 Save both `api_key` values from the responses.
@@ -406,22 +496,25 @@ Edit your Claude Desktop config file:
 {
   "mcpServers": {
     "bloom": {
-      "command": "bash",
-      "args": [
-        "-lc",
-        "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm use 20 >/dev/null; cd /path/to/Bloom; node --import tsx src/mcp/server.ts"
-      ],
+      "command": "/path/to/Bloom/scripts/mcp-wrapper.sh",
+      "args": [],
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
         "BLOOM_READ_KEY": "your_read_only_api_key",
-        "BLOOM_PROPOSE_KEY": "your_propose_only_api_key"
+        "BLOOM_PROPOSE_KEY": "your_propose_only_api_key",
+        "BLOOM_EXECUTE_KEY": "your_execute_only_api_key",
+        "BLOOM_ADMIN_KEY": "your_admin_key"
       }
     }
   }
 }
 ```
 
-Replace `/path/to/Bloom` with your actual repo path. This avoids pnpm/tsx banners on stdout, keeping the MCP protocol clean.
+Troubleshooting: If Claude shows `Server disconnected`, restart Claude Desktop after pulling changes and ensure the API
+server is running at `BLOOM_BASE_URL`. `BLOOM_EXECUTE_KEY` is required only for real Polymarket place/cancel tools.
+
+Replace `/path/to/Bloom` with your actual repo path. The wrapper forces Node 20 and keeps stdout clean (JSON-RPC only).
+If the wrapper is not executable, run: `chmod +x scripts/mcp-wrapper.sh`.
 
 ### Step 3: Restart Claude Desktop
 
@@ -470,6 +563,7 @@ Expected output: JSON with agent state.
 **"BLOOM_BASE_URL_required" or similar**
 - All three env vars are required: `BLOOM_BASE_URL`, `BLOOM_READ_KEY`, `BLOOM_PROPOSE_KEY`
 - Check for typos in the config file
+ - `BLOOM_EXECUTE_KEY` is only required for execute tools
 
 **"READ_KEY_scope_too_permissive"**
 - The read key must have ONLY `["read"]` scope
@@ -479,6 +573,10 @@ Expected output: JSON with agent state.
 **"PROPOSE_KEY_scope_too_permissive"**
 - The propose key must have ONLY `["propose"]` scope (or `["read", "propose"]`)
 - Keys with `execute`, `owner`, or `*` are rejected
+
+**"EXECUTE_KEY_scope_too_permissive"**
+- The execute key must have ONLY `["execute"]` scope
+- Keys with `propose`, `owner`, or `*` are rejected
 
 **Server not running / connection refused**
 - Ensure kernel is running: `curl http://localhost:3000/healthz`

@@ -1,0 +1,26 @@
+# Cloudflare Tunnel configuration for Bloom MCP gateway.
+# Copy this file to ~/.cloudflared/config.yml and update with your values.
+#
+# To set up:
+#   1. Install cloudflared: brew install cloudflared
+#   2. Login: cloudflared login
+#   3. Create tunnel: cloudflared tunnel create bloom-mcp
+#   4. Route DNS: cloudflared tunnel route dns bloom-mcp bloom-mcp.<your-domain>
+#   5. Copy this file to ~/.cloudflared/config.yml
+#   6. Update the tunnel UUID and hostname below
+#
+# Or use the helper script:
+#   ./scripts/mcp-chatgpt-stable-install.sh <your-domain>
+
+# Your tunnel UUID (from: cloudflared tunnel list)
+tunnel: YOUR_TUNNEL_UUID_HERE
+
+# Path to credentials file (created during tunnel create)
+credentials-file: /Users/YOUR_USERNAME/.cloudflared/YOUR_TUNNEL_UUID_HERE.json
+
+ingress:
+  # Route your hostname to the local MCP proxy
+  - hostname: bloom-mcp.YOUR_DOMAIN_HERE
+    service: http://localhost:8080
+  # Catch-all for unmatched requests
+  - service: http_status:404

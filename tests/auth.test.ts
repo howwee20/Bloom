@@ -41,6 +41,18 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: 2000,
     POLY_DRYRUN_MAX_OPEN_ORDERS: 20,
     POLY_DRYRUN_LOOP_SECONDS: 30,
+    POLY_MODE: "dryrun",
+    POLY_CLOB_HOST: "https://clob.polymarket.com",
+    POLY_GAMMA_HOST: "https://gamma-api.polymarket.com",
+    POLY_DATA_HOST: "https://data-api.polymarket.com",
+    POLY_CHAIN_ID: 137,
+    POLY_PRIVATE_KEY: null,
+    POLY_API_KEY: null,
+    POLY_API_SECRET: null,
+    POLY_API_PASSPHRASE: null,
+    POLY_BOT_AGENT_ID: "agent_ej",
+    POLY_BOT_LOOP_SECONDS: 60,
+    POLY_BOT_TRADING_ENABLED: false,
     ...overrides
   };
 }

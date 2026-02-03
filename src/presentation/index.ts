@@ -5,6 +5,7 @@ type ReceiptRow = {
   source: string;
   eventId: string | null;
   externalRef: string | null;
+  groupKey?: string | null;
   whatHappened: string;
   whyChanged: string;
   whatHappensNext: string;
@@ -12,7 +13,17 @@ type ReceiptRow = {
   createdAt: number;
 };
 
-type StepKind = "approved" | "needs_approval" | "held" | "sent" | "pending" | "confirmed" | "declined";
+type StepKind =
+  | "approved"
+  | "needs_approval"
+  | "held"
+  | "released"
+  | "canceled"
+  | "sent"
+  | "pending"
+  | "confirmed"
+  | "declined"
+  | "tick";
 
 type StepDetails = {
   amountCents?: number;
@@ -66,13 +77,16 @@ const REASON_REGEX = /reason=([^\s]+)/;
 const BLOCK_REGEX = /confirmed_block_number=(\d+)/;
 
 const STEP_ORDER: Record<StepKind, number> = {
+  tick: 0,
   approved: 1,
   needs_approval: 2,
   held: 3,
-  sent: 4,
-  pending: 5,
-  confirmed: 6,
-  declined: 7
+  released: 4,
+  canceled: 5,
+  sent: 6,
+  pending: 7,
+  confirmed: 8,
+  declined: 9
 };
 
 const REASON_MAP: Record<string, string> = {
@@ -217,6 +231,28 @@ export function mapReceiptToHumanStep(receipt: ReceiptRow): HumanStep | null {
     return { kind: "held", label: "Held", ...base };
   }
 
+  if (what.startsWith("Hold created.")) {
+    const amountCents = extractAmountCents(what);
+    return amountCents !== undefined
+      ? { kind: "held", label: "Held", ...base, details: { amountCents } }
+      : { kind: "held", label: "Held", ...base };
+  }
+
+  if (what.startsWith("Hold released.")) {
+    const amountCents = extractAmountCents(what);
+    return amountCents !== undefined
+      ? { kind: "released", label: "Released", ...base, details: { amountCents } }
+      : { kind: "released", label: "Released", ...base };
+  }
+
+  if (what.startsWith("Order canceled.") || what.startsWith("Dry-run order canceled.")) {
+    return { kind: "canceled", label: "Canceled", ...base };
+  }
+
+  if (what.startsWith("Order filled.")) {
+    return { kind: "confirmed", label: "Filled", ...base };
+  }
+
   if (what.startsWith("USDC transfer broadcast.")) {
     return {
       kind: "sent",
@@ -274,24 +310,29 @@ export function mapReceiptToHumanStep(receipt: ReceiptRow): HumanStep | null {
     return { kind: "pending", label: "Pending", ...base };
   }
 
+  if (what.startsWith("Polymarket bot tick")) {
+    return { kind: "tick", label: "Bot tick", ...base };
+  }
+
   return null;
 }
 
 function groupReceipts(receipts: ReceiptRow[]) {
-  const txHashByExternal = new Map<string, string>();
+  const txHashByGroup = new Map<string, string>();
   for (const receipt of receipts) {
     const txHash = extractTxHash(receipt.whatHappened ?? "");
-    if (txHash && receipt.externalRef) {
-      txHashByExternal.set(receipt.externalRef, txHash);
+    const groupKey = receipt.groupKey ?? undefined;
+    if (txHash && groupKey) {
+      txHashByGroup.set(groupKey, txHash);
     }
   }
 
   const groups = new Map<string, ReceiptRow[]>();
   for (const receipt of receipts) {
     const txHash = extractTxHash(receipt.whatHappened ?? "");
-    const externalRef = receipt.externalRef ?? undefined;
-    const mapped = externalRef ? txHashByExternal.get(externalRef) : undefined;
-    const key = txHash ?? mapped ?? externalRef ?? receipt.receiptId;
+    const groupKey = receipt.groupKey ?? undefined;
+    const mapped = groupKey ? txHashByGroup.get(groupKey) : undefined;
+    const key = txHash ?? mapped ?? groupKey ?? receipt.externalRef ?? receipt.receiptId;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key)?.push(receipt);
   }
@@ -311,18 +352,27 @@ function buildHeadline(
 
   const hasSent = steps.some((step) => step.kind === "sent");
   const hasHeld = steps.some((step) => step.kind === "held");
+  const hasReleased = steps.some((step) => step.kind === "released");
+  const hasCanceled = steps.some((step) => step.kind === "canceled");
+  const hasTick = steps.some((step) => step.kind === "tick");
   const hasApproved = steps.some((step) => step.kind === "approved");
   const hasNeedsApproval = steps.some((step) => step.kind === "needs_approval");
-  const verb = hasSent
-    ? "Sent"
-    : hasHeld
-      ? "Held"
-      : hasApproved
-        ? "Approved"
-        : hasNeedsApproval
-          ? "Needs approval"
-          : "Pending";
-  const statusLabel = status === "confirmed" ? "Confirmed" : "Pending";
+  if (hasTick) {
+    return "Polymarket bot tick · Observe-only";
+  }
+
+  const verb = hasCanceled
+    ? "Canceled"
+    : hasSent
+      ? "Sent"
+      : hasHeld
+        ? "Held"
+        : hasApproved
+          ? "Approved"
+          : hasNeedsApproval
+            ? "Needs approval"
+            : "Pending";
+  const statusLabel = hasReleased ? "Released" : status === "confirmed" ? "Confirmed" : "Pending";
 
   if (amountCents !== undefined && toAddress) {
     return `${verb} ${formatMoney(amountCents)} · ${shortenAddress(toAddress)} · ${statusLabel}`;
@@ -337,6 +387,9 @@ function formatSummaryStep(step: HumanStep, amountCents: number | undefined, now
   const timeLabel = formatClock(new Date(step.timestamp * 1000));
   let label = step.label;
   if ((step.kind === "held" || step.kind === "sent") && amountCents !== undefined) {
+    label = `${label} ${formatMoney(amountCents)}`;
+  }
+  if (step.kind === "released" && amountCents !== undefined) {
     label = `${label} ${formatMoney(amountCents)}`;
   }
   if (step.kind === "declined" && step.details?.reason) {
@@ -403,7 +456,7 @@ export function rollupTransactionByExternalRef(
 
   const status = deduped.some((step) => step.kind === "declined")
     ? "declined"
-    : deduped.some((step) => step.kind === "confirmed")
+    : deduped.some((step) => step.kind === "confirmed" || step.kind === "released" || step.kind === "canceled")
       ? "confirmed"
       : "pending";
 
@@ -437,9 +490,34 @@ export function buildUiActivity(receipts: ReceiptRow[], options: { limit?: numbe
     if (rollup) rollups.push(rollup);
   }
 
-  rollups.sort((a, b) => b.time - a.time);
-  const limit = options.limit ? Math.max(1, Math.floor(options.limit)) : rollups.length;
-  const trimmed = rollups.slice(0, limit);
+  const isApprovalOnly = (rollup: TransactionRollup) => {
+    if (rollup.status !== "pending") return false;
+    if (rollup.details?.amount_cents !== undefined) return false;
+    if (rollup.details?.to_address) return false;
+    if (rollup.details?.tx_hash) return false;
+    const kinds = new Set(rollup.steps.map((step) => step.kind));
+    if (kinds.size === 0) return false;
+    for (const kind of kinds) {
+      if (kind !== "approved" && kind !== "pending") return false;
+    }
+    return true;
+  };
+
+  const suppressWindowSeconds = 5 * 60;
+  const filtered = rollups.filter((rollup) => {
+    if (!isApprovalOnly(rollup)) return true;
+    const hasNearbyFull = rollups.some(
+      (other) =>
+        other !== rollup &&
+        !isApprovalOnly(other) &&
+        Math.abs(other.time - rollup.time) <= suppressWindowSeconds
+    );
+    return !hasNearbyFull;
+  });
+
+  filtered.sort((a, b) => b.time - a.time);
+  const limit = options.limit ? Math.max(1, Math.floor(options.limit)) : filtered.length;
+  const trimmed = filtered.slice(0, limit);
 
   return trimmed.map((rollup) => {
     const amountCents = rollup.details?.amount_cents;

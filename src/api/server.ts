@@ -24,7 +24,7 @@ import {
   stepUpChallenges,
   users
 } from "../db/schema.js";
-import { and, desc, eq } from "drizzle-orm";
+import { and, desc, eq, inArray } from "drizzle-orm";
 import type { DbClient } from "../db/database.js";
 import Database from "better-sqlite3";
 import type { IEnvironment } from "../env/IEnvironment.js";
@@ -33,9 +33,12 @@ import { appendEvent } from "../kernel/events.js";
 import { createReceipt } from "../kernel/receipts.js";
 import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 import { CARD_SIGNATURE_HEADER, CARD_TIMESTAMP_HEADER, verifyCardSignature } from "./card_webhook.js";
+import { PolymarketBot } from "../bots/polymarket_bot.js";
 import { PolymarketDryrunBot } from "../bots/polymarket_dryrun_bot.js";
 import { PolymarketDryrunDriver } from "../drivers/polymarket_dryrun_driver.js";
+import { PolymarketRealDriver } from "../drivers/polymarket_real_driver.js";
 import { buildUiActivity, formatMoney, formatUpdated } from "../presentation/index.js";
+import { reconcilePolymarketOrders } from "../polymarket/reconcile.js";
 
 type AuthUser = {
   userId: string;
@@ -283,8 +286,11 @@ export function buildServer(options: {
     (config.ENV_TYPE === "base_usdc"
       ? new BaseUsdcWorld(db, sqlite, config)
       : new SimpleEconomyWorld(db, sqlite, config));
-  const kernel = new Kernel(db, sqlite, env, config, [new PolymarketDryrunDriver()]);
-  const polymarketBot = new PolymarketDryrunBot(db, sqlite, config);
+  const polymarketDriver =
+    config.POLY_MODE === "real" ? new PolymarketRealDriver() : new PolymarketDryrunDriver();
+  const kernel = new Kernel(db, sqlite, env, config, [polymarketDriver]);
+  const polymarketDryrunBot = new PolymarketDryrunBot(db, sqlite, config);
+  const polymarketBot = new PolymarketBot(db, sqlite, config);
 
   const app = Fastify({ logger: true });
 
@@ -501,7 +507,7 @@ export function buildServer(options: {
     const agentId = String(body.agent_id ?? "").trim();
     if (!agentId) return reply.status(400).send({ error: "agent_id_required" });
     try {
-      const status = polymarketBot.start(agentId);
+      const status = polymarketDryrunBot.start(agentId);
       return reply.send(status);
     } catch (error) {
       const message = error instanceof Error ? error.message : "invalid_request";
@@ -511,13 +517,56 @@ export function buildServer(options: {
 
   app.post("/api/bots/polymarket_dryrun/stop", { config: { auth: "admin" } }, async (request, reply) => {
     if (!requireAdminKey(config, request, reply)) return;
-    const status = polymarketBot.stop();
+    const status = polymarketDryrunBot.stop();
     return reply.send(status);
   });
 
   app.get("/api/bots/polymarket_dryrun/status", async (request, reply) => {
     if (!requireScope(request, reply, "read")) return;
+    return reply.send(polymarketDryrunBot.status());
+  });
+
+  app.post("/api/bots/polymarket/start", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = (request.body ?? {}) as { agent_id?: string };
+    const agentIdRaw = body.agent_id ? String(body.agent_id).trim() : "";
+    try {
+      const status = await polymarketBot.start(agentIdRaw || undefined);
+      return reply.send(status);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "invalid_request";
+      return reply.status(400).send({ error: message });
+    }
+  });
+
+  app.post("/api/bots/polymarket/stop", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const status = polymarketBot.stop();
+    return reply.send(status);
+  });
+
+  app.get("/api/bots/polymarket/status", async (request, reply) => {
+    if (!requireScope(request, reply, "read")) return;
     return reply.send(polymarketBot.status());
+  });
+
+  app.post("/api/bots/polymarket/kill", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const body = (request.body ?? {}) as { cancel_orders?: boolean };
+    const cancelOrders = body.cancel_orders === true;
+    try {
+      const result = await polymarketBot.kill({ db, sqlite, cancelOrders });
+      return reply.send(result);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "kill_failed";
+      return reply.status(500).send({ error: message });
+    }
+  });
+
+  app.post("/api/polymarket/reconcile", { config: { auth: "admin" } }, async (request, reply) => {
+    if (!requireAdminKey(config, request, reply)) return;
+    const result = await reconcilePolymarketOrders({ db, sqlite, config });
+    return reply.send(result);
   });
 
   app.post("/api/step_up/request", async (request, reply) => {
@@ -667,7 +716,28 @@ export function buildServer(options: {
       .limit(receiptLimit)
       .all();
 
-    const activity = buildUiActivity(rows, { limit: bounded, nowSeconds: nowSeconds() });
+    const eventIds = rows.map((row) => row.eventId).filter((eventId): eventId is string => Boolean(eventId));
+    const quoteIdByEvent = new Map<string, string>();
+    if (eventIds.length > 0) {
+      const eventRows = db.select().from(events).where(inArray(events.eventId, eventIds)).all();
+      for (const event of eventRows) {
+        const payload = parseJson<Record<string, unknown>>(event.payloadJson, {});
+        const quoteId = (payload as { quote_id?: unknown }).quote_id;
+        if (typeof quoteId === "string" && quoteId.length > 0) {
+          quoteIdByEvent.set(event.eventId, quoteId);
+        }
+      }
+    }
+
+    type ReceiptWithGroupKey = (typeof receipts.$inferSelect) & { groupKey?: string };
+    const rowsWithGroupKey: ReceiptWithGroupKey[] = rows.map((row) => {
+      const quoteId = row.eventId ? quoteIdByEvent.get(row.eventId) : undefined;
+      if (quoteId) return { ...row, groupKey: quoteId };
+      if (row.externalRef) return { ...row, groupKey: row.externalRef };
+      return row;
+    });
+
+    const activity = buildUiActivity(rowsWithGroupKey, { limit: bounded, nowSeconds: nowSeconds() });
     return reply.send(activity);
   });
 

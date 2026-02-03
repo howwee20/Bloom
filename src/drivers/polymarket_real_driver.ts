@@ -1,4 +1,3 @@
-import type Database from "better-sqlite3";
 import { and, eq } from "drizzle-orm";
 import { cardHolds, executions, polymarketOrders } from "../db/schema.js";
 import { appendEvent } from "../kernel/events.js";
@@ -6,9 +5,16 @@ import { createReceipt } from "../kernel/receipts.js";
 import { newId, nowSeconds } from "../kernel/utils.js";
 import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 import {
+  extractOrderId,
+  createClobClient,
+  OrderType,
+  Side
+} from "../polymarket/clob.js";
+import {
   findOrderByClientId,
   getOpenHoldsCents,
   getOpenOrderCount,
+  getPolymarketSpendTodayCents,
   isAllowlisted,
   normalizeCancelIntent,
   normalizePlaceIntent
@@ -22,8 +28,36 @@ import type {
   DriverPreConstraintsContext,
   IntentDriver
 } from "./intent_driver.js";
+import type { Config } from "../config.js";
+import type { PolymarketClobClient } from "../polymarket/clob.js";
 
-export class PolymarketDryrunDriver implements IntentDriver {
+type ClobClientFactory = (config: Config) => Promise<PolymarketClobClient>;
+
+function ensureRealMode(config: Config) {
+  return config.POLY_MODE === "real";
+}
+
+function hasPrivateKey(config: Config) {
+  return Boolean(config.POLY_PRIVATE_KEY && config.POLY_PRIVATE_KEY.trim().length > 0);
+}
+
+function orderResponseError(response: Record<string, unknown>) {
+  const ok = response.success === undefined ? undefined : Boolean(response.success);
+  if (ok === false) {
+    return String(response.errorMsg ?? response.message ?? "order_rejected");
+  }
+  if (response.errorMsg || response.error) {
+    return String(response.errorMsg ?? response.error ?? "order_rejected");
+  }
+  return null;
+}
+
+export class PolymarketRealDriver implements IntentDriver {
+  private clientFactory: ClobClientFactory;
+
+  constructor(options: { clientFactory?: ClobClientFactory } = {}) {
+    this.clientFactory = options.clientFactory ?? createClobClient;
+  }
 
   supports(intentType: string): boolean {
     return intentType === "polymarket_place_order" || intentType === "polymarket_cancel_order";
@@ -53,6 +87,12 @@ export class PolymarketDryrunDriver implements IntentDriver {
   }
 
   preConstraints(ctx: DriverPreConstraintsContext): DriverDecision {
+    if (!ensureRealMode(ctx.config)) {
+      return { allowed: false, reason: "polymarket_real_disabled" };
+    }
+    if (!hasPrivateKey(ctx.config)) {
+      return { allowed: false, reason: "polymarket_private_key_missing" };
+    }
     if (!isAllowlisted(ctx.config, ctx.agentId)) {
       return { allowed: false, reason: "intent_not_allowlisted" };
     }
@@ -69,18 +109,29 @@ export class PolymarketDryrunDriver implements IntentDriver {
         }
       }
 
-      if (costCents > ctx.config.POLY_DRYRUN_MAX_PER_ORDER_CENTS) {
+      // Use real limits (not dryrun)
+      if (costCents > ctx.config.POLY_MAX_PER_ORDER_CENTS) {
         return { allowed: false, reason: "order_cost_exceeds_max" };
       }
       const openOrders = getOpenOrderCount(ctx.sqlite, ctx.agentId);
-      if (openOrders >= ctx.config.POLY_DRYRUN_MAX_OPEN_ORDERS) {
+      if (openOrders >= ctx.config.POLY_MAX_OPEN_ORDERS) {
         return { allowed: false, reason: "open_orders_limit_reached" };
       }
       const openHolds = getOpenHoldsCents(ctx.sqlite, ctx.agentId);
-      if (openHolds + costCents > ctx.config.POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS) {
+      if (openHolds + costCents > ctx.config.POLY_MAX_OPEN_HOLDS_CENTS) {
         return { allowed: false, reason: "open_holds_limit_exceeded" };
       }
-      return { allowed: true, reason: "ok", requires_step_up: false };
+
+      // Step-up requirement when trading is enabled
+      // Unless auto-approve is set AND agent is in allowlist
+      let requiresStepUp = false;
+      if (ctx.config.POLY_BOT_TRADING_ENABLED) {
+        const autoApprove = ctx.config.POLY_TRADE_AUTO_APPROVE;
+        const inAutoApproveList = ctx.config.BLOOM_AUTO_APPROVE_AGENT_IDS.includes(ctx.agentId);
+        requiresStepUp = !(autoApprove && inAutoApproveList);
+      }
+
+      return { allowed: true, reason: "ok", requires_step_up: requiresStepUp };
     }
 
     if (ctx.intentType === "polymarket_cancel_order") {
@@ -117,6 +168,24 @@ export class PolymarketDryrunDriver implements IntentDriver {
       }
     }
 
+    // Check daily limit (real mode)
+    const maxDailyCents = ctx.config.POLY_MAX_PER_DAY_CENTS;
+    if (maxDailyCents > 0) {
+      const spendTodayCents = getPolymarketSpendTodayCents(ctx.sqlite, ctx.agentId);
+      if (spendTodayCents + costCents > maxDailyCents) {
+        return {
+          allowed: false,
+          reason: "daily_limit_reached",
+          spend_power: {
+            spend_today_cents: spendTodayCents,
+            trade_cost_cents: costCents,
+            max_daily_cents: maxDailyCents
+          },
+          facts_snapshot: ctx.factsSnapshotBase
+        };
+      }
+    }
+
     const spendPower = Math.max(0, ctx.policySpendableCents - ctx.reservedHoldsCents);
     if (costCents > spendPower) {
       return {
@@ -133,7 +202,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
     return { allowed: true, reason: "ok", requires_step_up: false };
   }
 
-  execute(ctx: DriverExecuteContext): DriverExecuteResponse {
+  async execute(ctx: DriverExecuteContext): Promise<DriverExecuteResponse> {
     const intentType = String(ctx.intent.type ?? "");
     if (intentType === "polymarket_place_order") {
       return this.executePlace(ctx);
@@ -144,7 +213,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
     return { status: "rejected", reason: "unsupported_intent" };
   }
 
-  private executePlace(ctx: DriverExecuteContext): DriverExecuteResponse {
+  private async executePlace(ctx: DriverExecuteContext): Promise<DriverExecuteResponse> {
     const normalized = normalizePlaceIntent(ctx.intent);
     if (!normalized.ok) {
       const event = appendEvent(ctx.db, ctx.sqlite, {
@@ -164,6 +233,10 @@ export class PolymarketDryrunDriver implements IntentDriver {
         whatHappensNext: "Request a new quote."
       });
       return { status: "rejected", reason: normalized.reason };
+    }
+
+    if (!ensureRealMode(ctx.config)) {
+      return { status: "rejected", reason: "polymarket_real_disabled" };
     }
 
     const { intent, clientOrderId, costCents } = normalized;
@@ -196,7 +269,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
             source: "execution",
             eventId: event.event_id,
             externalRef: existingOrder.orderId,
-            whatHappened: "Dry-run order already exists.",
+            whatHappened: "Order already exists.",
             whyChanged: "idempotent_replay",
             whatHappensNext: "No new hold created."
           });
@@ -206,11 +279,66 @@ export class PolymarketDryrunDriver implements IntentDriver {
       }
     }
 
-    const orderId = newId("poly_order");
-    const holdId = orderId;
+    let orderId: string | null = null;
+    let clobResponse: Record<string, unknown> | null = null;
+    try {
+      const client = await this.clientFactory(ctx.config);
+      clobResponse = await client.createAndPostOrder(
+        {
+          tokenID: String(intent.token_id),
+          price: Number(intent.price),
+          size: Number(intent.size),
+          side: Side.BUY
+        },
+        undefined,
+        OrderType.GTC
+      );
+      orderId = extractOrderId(clobResponse);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "order_post_failed";
+      const event = appendEvent(ctx.db, ctx.sqlite, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        type: "execution_failed",
+        payload: { reason, quote_id: ctx.quote.quoteId }
+      });
+      createReceipt(ctx.db, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        source: "execution",
+        eventId: event.event_id,
+        externalRef: ctx.quote.quoteId,
+        whatHappened: "Execution failed before apply.",
+        whyChanged: reason,
+        whatHappensNext: "Review constraints and retry."
+      });
+      return { status: "failed", reason };
+    }
+
+    const responseError = clobResponse ? orderResponseError(clobResponse) : null;
+    if (!orderId || responseError) {
+      const reason = responseError ?? "order_post_failed";
+      const event = appendEvent(ctx.db, ctx.sqlite, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        type: "execution_failed",
+        payload: { reason, quote_id: ctx.quote.quoteId }
+      });
+      createReceipt(ctx.db, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        source: "execution",
+        eventId: event.event_id,
+        externalRef: ctx.quote.quoteId,
+        whatHappened: "Execution failed before apply.",
+        whyChanged: reason,
+        whatHappensNext: "Review constraints and retry."
+      });
+      return { status: "failed", reason };
+    }
+
     const execId = newId("exec");
     const now = nowSeconds();
-
     const tx = ctx.sqlite.transaction(() => {
       ctx.db.insert(executions).values({
         execId,
@@ -239,7 +367,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
       }).run();
 
       ctx.db.insert(cardHolds).values({
-        authId: holdId,
+        authId: orderId,
         agentId: ctx.quote.agentId,
         amountCents: costCents,
         status: "pending",
@@ -251,7 +379,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
       const orderEvent = appendEvent(ctx.db, ctx.sqlite, {
         agentId: ctx.quote.agentId,
         userId: ctx.quote.userId,
-        type: "polymarket_order_opened",
+        type: "polymarket_order_posted",
         payload: {
           quote_id: ctx.quote.quoteId,
           order_id: orderId,
@@ -270,16 +398,16 @@ export class PolymarketDryrunDriver implements IntentDriver {
         source: "execution",
         eventId: orderEvent.event_id,
         externalRef: orderId,
-        whatHappened: "Dry-run order opened.",
-        whyChanged: "dryrun_open",
-        whatHappensNext: "Order is open (dry-run)."
+        whatHappened: "Order posted.",
+        whyChanged: "order_posted",
+        whatHappensNext: "Order is open."
       });
 
       const holdEvent = appendEvent(ctx.db, ctx.sqlite, {
         agentId: ctx.quote.agentId,
         userId: ctx.quote.userId,
         type: "polymarket_hold_created",
-        payload: { order_id: orderId, hold_id: holdId, amount_cents: costCents, quote_id: ctx.quote.quoteId }
+        payload: { order_id: orderId, amount_cents: costCents, quote_id: ctx.quote.quoteId }
       });
       createReceipt(ctx.db, {
         agentId: ctx.quote.agentId,
@@ -306,7 +434,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
         externalRef: orderId,
         whatHappened: "Execution applied.",
         whyChanged: "applied",
-        whatHappensNext: "Order remains open (dry-run)."
+        whatHappensNext: "Order is open."
       });
     });
 
@@ -343,7 +471,7 @@ export class PolymarketDryrunDriver implements IntentDriver {
     return { status: "applied", exec_id: execId, external_ref: orderId };
   }
 
-  private executeCancel(ctx: DriverExecuteContext): DriverExecuteResponse {
+  private async executeCancel(ctx: DriverExecuteContext): Promise<DriverExecuteResponse> {
     const normalized = normalizeCancelIntent(ctx.intent);
     if (!normalized.ok) {
       const event = appendEvent(ctx.db, ctx.sqlite, {
@@ -363,6 +491,10 @@ export class PolymarketDryrunDriver implements IntentDriver {
         whatHappensNext: "Request a new quote."
       });
       return { status: "rejected", reason: normalized.reason };
+    }
+
+    if (!ensureRealMode(ctx.config)) {
+      return { status: "rejected", reason: "polymarket_real_disabled" };
     }
 
     const orderId = String((normalized.intent as { order_id?: string }).order_id ?? "");
@@ -391,8 +523,8 @@ export class PolymarketDryrunDriver implements IntentDriver {
       return { status: "rejected", reason: "order_not_found" };
     }
 
-    const now = nowSeconds();
     const execId = newId("exec");
+    const now = nowSeconds();
     if (existingOrder.status === "canceled") {
       const tx = ctx.sqlite.transaction(() => {
         ctx.db.insert(executions).values({
@@ -418,13 +550,37 @@ export class PolymarketDryrunDriver implements IntentDriver {
           source: "execution",
           eventId: event.event_id,
           externalRef: orderId,
-          whatHappened: "Dry-run order already canceled.",
+          whatHappened: "Order already canceled.",
           whyChanged: "idempotent_replay",
           whatHappensNext: "No action required."
         });
       });
       tx();
       return { status: "idempotent", exec_id: execId, external_ref: orderId };
+    }
+
+    try {
+      const client = await this.clientFactory(ctx.config);
+      await client.cancelOrder({ orderID: orderId });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "cancel_failed";
+      const event = appendEvent(ctx.db, ctx.sqlite, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        type: "execution_failed",
+        payload: { reason, quote_id: ctx.quote.quoteId, order_id: orderId }
+      });
+      createReceipt(ctx.db, {
+        agentId: ctx.quote.agentId,
+        userId: ctx.quote.userId,
+        source: "execution",
+        eventId: event.event_id,
+        externalRef: orderId,
+        whatHappened: "Execution failed before apply.",
+        whyChanged: reason,
+        whatHappensNext: "Review order status and retry."
+      });
+      return { status: "failed", reason };
     }
 
     const tx = ctx.sqlite.transaction(() => {
@@ -463,9 +619,9 @@ export class PolymarketDryrunDriver implements IntentDriver {
         source: "execution",
         eventId: orderEvent.event_id,
         externalRef: orderId,
-        whatHappened: "Dry-run order canceled.",
-        whyChanged: "dryrun_canceled",
-        whatHappensNext: "Order is closed (dry-run)."
+        whatHappened: "Order canceled.",
+        whyChanged: "canceled",
+        whatHappensNext: "Order is closed."
       });
 
       const holdEvent = appendEvent(ctx.db, ctx.sqlite, {

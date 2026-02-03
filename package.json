@@ -18,19 +18,27 @@
     "replay": "tsx src/workers/replay.ts",
     "release:alpha": "pnpm install && pnpm test && node scripts/release_tag.cjs",
     "worker:base_usdc": "tsx src/workers/reconcile_base_usdc.ts",
+    "worker:polymarket": "tsx src/workers/polymarket_reconcile.ts",
     "mcp": "node --import tsx src/mcp/server.ts",
+    "mcp:chatgpt": "./scripts/mcp-chatgpt.sh",
+    "mcp:chatgpt:tunnel": "./scripts/mcp-chatgpt.sh --tunnel",
+    "mcp:chatgpt:stable": "./scripts/mcp-chatgpt-stable.sh",
+    "mcp:chatgpt:stable:install": "./scripts/mcp-chatgpt-stable-install.sh",
     "mcp:smoke": "tsx scripts/mcp_smoke_test.ts",
     "preflight": "tsx scripts/preflight.ts",
     "keys:mint": "tsx scripts/keys_mint.ts",
     "agent:init": "tsx scripts/agent_init.ts",
     "env:print": "tsx scripts/env_print.ts",
-    "polymarket:dryrun": "tsx scripts/polymarket_dryrun.ts"
+    "polymarket:dryrun": "tsx scripts/polymarket_dryrun.ts",
+    "polymarket:cancel": "tsx scripts/polymarket_cancel.ts"
   },
   "dependencies": {
-    "dotenv": "^16.4.5",
     "@modelcontextprotocol/sdk": "^0.6.0",
+    "@polymarket/clob-client": "^4.9.2",
     "better-sqlite3": "^9.4.5",
+    "dotenv": "^16.4.5",
     "drizzle-orm": "^0.38.2",
+    "ethers": "^5.7.2",
     "fastify": "^4.26.2",
     "viem": "^2.45.0"
   },
@@ -38,6 +46,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^20.11.24",
     "drizzle-kit": "^0.24.2",
+    "mcp-proxy": "^6.4.0",
     "tsx": "^4.7.1",
     "typescript": "^5.4.5",
     "vitest": "^1.4.0"

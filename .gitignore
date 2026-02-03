@@ -3,3 +3,7 @@ dist
 data
 .env
 *.db
+
+# Cloudflared config (contains secrets)
+.cloudflared/config.yml
+.cloudflared/*.json

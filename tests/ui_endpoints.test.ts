@@ -10,6 +10,7 @@ import {
   cardHolds
 } from "../src/db/schema.js";
 import { createReceipt } from "../src/kernel/receipts.js";
+import { appendEvent } from "../src/kernel/events.js";
 import { nowSeconds } from "../src/kernel/utils.js";
 import { mapReasonToHuman } from "../src/presentation/index.js";
 
@@ -49,6 +50,18 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     POLY_DRYRUN_MAX_OPEN_HOLDS_CENTS: 2000,
     POLY_DRYRUN_MAX_OPEN_ORDERS: 20,
     POLY_DRYRUN_LOOP_SECONDS: 30,
+    POLY_MODE: "dryrun",
+    POLY_CLOB_HOST: "https://clob.polymarket.com",
+    POLY_GAMMA_HOST: "https://gamma-api.polymarket.com",
+    POLY_DATA_HOST: "https://data-api.polymarket.com",
+    POLY_CHAIN_ID: 137,
+    POLY_PRIVATE_KEY: null,
+    POLY_API_KEY: null,
+    POLY_API_SECRET: null,
+    POLY_API_PASSPHRASE: null,
+    POLY_BOT_AGENT_ID: "agent_ej",
+    POLY_BOT_LOOP_SECONDS: 60,
+    POLY_BOT_TRADING_ENABLED: false,
     ...overrides
   };
 }
@@ -222,6 +235,74 @@ describe("UI endpoints", () => {
     expect(item.details.amount).toBe("$1.00");
     expect(item.details.to).toBe("0x56B0…3351");
     expect(item.details.tx_hash?.startsWith("0x352f")).toBe(true);
+
+    await app.close();
+  });
+
+  it("groups ui/activity by quote_id from events", async () => {
+    const { app, db, sqlite, kernel } = await createApp();
+    const { agent_id, user_id } = kernel.createAgent({ userId: "user_ui", agentId: "agent_ui" });
+
+    const keyRes = await app.inject({
+      method: "POST",
+      url: "/api/admin/keys",
+      headers: { "x-admin-key": "adminkey" },
+      payload: { user_id: "user_ui", scopes: ["read"] }
+    });
+    const apiKey = (keyRes.json() as { api_key: string }).api_key;
+
+    const base = nowSeconds();
+    const stepUpEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "step_up_requested",
+      payload: { quote_id: "quote_ui", challenge_id: "challenge_ui" },
+      occurredAt: base - 2
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "policy",
+      eventId: stepUpEvent.event_id,
+      externalRef: "challenge_ui",
+      whatHappened: "Step-up challenge created.",
+      whyChanged: "step_up_requested",
+      whatHappensNext: "Approve or deny.",
+      occurredAt: base - 2
+    });
+
+    const execEvent = appendEvent(db, sqlite, {
+      agentId: agent_id,
+      userId: user_id,
+      type: "execution_applied",
+      payload: { quote_id: "quote_ui", exec_id: "exec_ui" },
+      occurredAt: base - 1
+    });
+    createReceipt(db, {
+      agentId: agent_id,
+      userId: user_id,
+      source: "execution",
+      eventId: execEvent.event_id,
+      externalRef: "order_ui",
+      whatHappened: "Execution applied.",
+      whyChanged: "applied",
+      whatHappensNext: "Observation will reflect changes.",
+      occurredAt: base - 1
+    });
+
+    const res = await app.inject({
+      method: "GET",
+      url: `/api/ui/activity?agent_id=${agent_id}&limit=5`,
+      headers: { "x-api-key": apiKey }
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as Array<Record<string, unknown>>;
+    expect(body.length).toBe(1);
+    const item = body[0] as { id: string; summary: string[] };
+    expect(item.id).toBe("quote_ui");
+    expect(item.summary.some((entry) => entry.startsWith("Needs approval"))).toBe(true);
+    expect(item.summary.some((entry) => entry.startsWith("Pending"))).toBe(true);
 
     await app.close();
   });

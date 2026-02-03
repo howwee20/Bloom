@@ -723,6 +723,7 @@ export class Kernel {
       userId: input.user_id,
       type: "policy_decision",
       payload: {
+        quote_id: quoteId,
         allowed: decision.allowed,
         reason: decision.reason,
         requires_step_up: decision.requires_step_up ?? false,
@@ -1256,7 +1257,7 @@ export class Kernel {
         agentId: quote.agentId,
         userId: quote.userId,
         type: "env_action",
-        payload: { intent, ok: envResult.ok, env_events: envResult.envEvents }
+        payload: { intent, ok: envResult.ok, env_events: envResult.envEvents, quote_id: quote.quoteId }
       });
       createReceipt(this.db, {
         agentId: quote.agentId,
@@ -1657,7 +1658,8 @@ export class Kernel {
           ok: envResult.ok,
           env_events: envResult.envEvents,
           tx_hash: txHash,
-          spend_power: decision.spend_power
+          spend_power: decision.spend_power,
+          quote_id: quote.quoteId
         }
       });
       const spend = decision.spend_power;
