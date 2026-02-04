@@ -14,6 +14,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/api/server.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "console:dev": "tsx scripts/console_dev.ts",
+    "console:first-run": "tsx scripts/first_run.ts",
     "test": "vitest run",
     "replay": "tsx src/workers/replay.ts",
     "release:alpha": "pnpm install && pnpm test && node scripts/release_tag.cjs",

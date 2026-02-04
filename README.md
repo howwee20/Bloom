@@ -67,6 +67,7 @@ The one true way to run the kernel. Works on any machine with Docker Desktop.
 git clone https://github.com/howwee20/Bloom.git
 cd Bloom
 cp .env.example .env
+# edit .env and set ANTHROPIC_API_KEY (and CONSOLE_PASSWORD if exposing the console)
 docker compose up -d --build
 ```
 
@@ -86,25 +87,33 @@ Expected output:
 
 ## Bloom Console (Reference Client v0)
 
-The console is a lightweight web client that talks to the kernel via the public API and uses Claude Sonnet as the planner. It does **not** modify kernel behavior.
+The console is the canonical self-hosted client for Bloom. It uses a local session cookie (no API keys in the browser) and Claude Sonnet for planning. It does **not** modify kernel behavior.
 
 ### Prerequisites
 
-- Set `ANTHROPIC_API_KEY` in `.env`
-- Optional: set `CONSOLE_BOOTSTRAP_TOKEN` to require a bootstrap code for new accounts
+- Set `ANTHROPIC_API_KEY` in `.env` (required for chat)
+- Optional: set `CONSOLE_PASSWORD` (required if you expose the console beyond localhost)
+- Optional: set `CONSOLE_BOOTSTRAP_TOKEN` to require a bootstrap code on first run
 
-### Run
+### One-command up (local)
 
 ```bash
-pnpm dev
+pnpm console:dev
 ```
 
 Open `http://localhost:3000/console`.
 
+### First run (non-watch)
+
+```bash
+pnpm console:first-run
+```
+
 ### Notes
 
-- "Create Bloom" uses a local bootstrap endpoint to mint a user, agent, and API key.
-- "Add money" shows the agent wallet address (Base USDC env).
+- First login creates a single Bloom account for the console and stores it server-side.
+- Sessions are stored in an httpOnly cookie; sign out from the account card.
+- Chat streams tokens; the Stop button cancels the current response.
 - The assistant only proposes actions; execution always requires explicit approval.
 ```json
 {

@@ -31,6 +31,11 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     CONFIRMATIONS_REQUIRED: 5,
     USDC_BUFFER_CENTS: 0,
     DEV_MASTER_MNEMONIC: null,
+    ANTHROPIC_API_KEY: null,
+    ANTHROPIC_MODEL: "claude-3-5-sonnet-20240620",
+    CONSOLE_BOOTSTRAP_TOKEN: null,
+    CONSOLE_PASSWORD: null,
+    CONSOLE_SESSION_TTL_SECONDS: 12 * 60 * 60,
     ...overrides
   };
 }

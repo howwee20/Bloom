@@ -301,3 +301,18 @@ export const baseUsdcActionDedup = sqliteTable(
     pk: primaryKey({ columns: [table.agentId, table.idempotencyKey] })
   })
 );
+
+export const consoleState = sqliteTable("console_state", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  agentId: text("agent_id").notNull(),
+  createdAt: integer("created_at").notNull()
+});
+
+export const consoleSessions = sqliteTable("console_sessions", {
+  sessionId: text("session_id").primaryKey(),
+  userId: text("user_id").notNull(),
+  agentId: text("agent_id").notNull(),
+  createdAt: integer("created_at").notNull(),
+  expiresAt: integer("expires_at").notNull()
+});

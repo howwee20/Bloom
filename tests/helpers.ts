@@ -40,7 +40,12 @@ export function createTestContext(overrides: Partial<Config> = {}) {
     BASE_USDC_CONTRACT: overrides.BASE_USDC_CONTRACT ?? null,
     CONFIRMATIONS_REQUIRED: overrides.CONFIRMATIONS_REQUIRED ?? 5,
     USDC_BUFFER_CENTS: overrides.USDC_BUFFER_CENTS ?? 0,
-    DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null
+    DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null,
+    ANTHROPIC_API_KEY: overrides.ANTHROPIC_API_KEY ?? null,
+    ANTHROPIC_MODEL: overrides.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",
+    CONSOLE_BOOTSTRAP_TOKEN: overrides.CONSOLE_BOOTSTRAP_TOKEN ?? null,
+    CONSOLE_PASSWORD: overrides.CONSOLE_PASSWORD ?? null,
+    CONSOLE_SESSION_TTL_SECONDS: overrides.CONSOLE_SESSION_TTL_SECONDS ?? 12 * 60 * 60
   };
   const env = new SimpleEconomyWorld(db, sqlite, config);
   const kernel = new Kernel(db, sqlite, env, config);

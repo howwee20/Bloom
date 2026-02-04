@@ -2,6 +2,9 @@ services:
   api:
     build: .
     env_file: .env
+    environment:
+      - DB_PATH=/data/kernel.db
+      - BLOOM_DOCKER=true
     ports:
       - "3000:3000"
     volumes:
@@ -17,6 +20,9 @@ services:
   worker:
     build: .
     env_file: .env
+    environment:
+      - DB_PATH=/data/kernel.db
+      - BLOOM_DOCKER=true
     volumes:
       - bloom_data:/data
     command: ["sh", "-c", "pnpm migrate && pnpm worker:base_usdc"]

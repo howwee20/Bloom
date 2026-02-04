@@ -16,6 +16,8 @@ import {
   apiKeys,
   budgets,
   cardHolds,
+  consoleSessions,
+  consoleState,
   events,
   policies,
   quotes,
@@ -32,6 +34,7 @@ import { appendEvent } from "../kernel/events.js";
 import { createReceipt } from "../kernel/receipts.js";
 import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 import { CARD_SIGNATURE_HEADER, CARD_TIMESTAMP_HEADER, verifyCardSignature } from "./card_webhook.js";
+import { buildUiActivity, formatMoney, shortenAddress } from "../presentation/index.js";
 
 type AuthUser = {
   userId: string;
@@ -135,6 +138,129 @@ function parseWindowSeconds(value: string | undefined, fallbackSeconds: number) 
   }
   const numeric = Number(trimmed);
   return Number.isFinite(numeric) ? numeric : fallbackSeconds;
+}
+
+type ConsoleChatMessage = { role: "user" | "assistant"; content: string };
+
+type AnthropicContentBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: Record<string, unknown> };
+
+type AnthropicResponse = {
+  id: string;
+  type: string;
+  role: "assistant";
+  content: AnthropicContentBlock[];
+  stop_reason: string;
+};
+
+type AnthropicMessage = {
+  role: "user" | "assistant";
+  content: string | AnthropicContentBlock[] | unknown[];
+};
+
+const CONSOLE_COOKIE_NAME = "bloom_console_session";
+
+function isLoopback(ip: string | undefined) {
+  if (!ip) return false;
+  return ip === "127.0.0.1" || ip === "::1" || ip.startsWith("::ffff:127.");
+}
+
+function resolveConsoleAsset(assetName: string) {
+  const candidates = [path.resolve("src/console", assetName), path.resolve("dist/console", assetName)];
+  for (const candidate of candidates) {
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function parseCookies(header: string | undefined) {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  header.split(";").forEach((part) => {
+    const [rawKey, ...rest] = part.trim().split("=");
+    if (!rawKey) return;
+    out[rawKey] = rest.join("=") ?? "";
+  });
+  return out;
+}
+
+function setConsoleCookie(reply: FastifyReply, value: string, maxAgeSeconds: number) {
+  const parts = [
+    `${CONSOLE_COOKIE_NAME}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`
+  ];
+  reply.header("set-cookie", parts.join("; "));
+}
+
+function clearConsoleCookie(reply: FastifyReply) {
+  reply.header("set-cookie", `${CONSOLE_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+}
+
+async function callAnthropic(options: {
+  apiKey: string;
+  model: string;
+  system: string;
+  messages: AnthropicMessage[];
+  tools: Array<{ name: string; description: string; input_schema: Record<string, unknown> }>;
+  maxTokens?: number;
+}) {
+  const response = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": options.apiKey,
+      "anthropic-version": "2023-06-01"
+    },
+    body: JSON.stringify({
+      model: options.model,
+      system: options.system,
+      max_tokens: options.maxTokens ?? 800,
+      messages: options.messages,
+      tools: options.tools,
+      temperature: 0.2
+    })
+  });
+
+  const raw = await response.text();
+  if (!response.ok) {
+    throw new Error(raw || `Anthropic error ${response.status}`);
+  }
+  return JSON.parse(raw) as AnthropicResponse;
+}
+
+function buildConsoleSystemPrompt(agentId: string) {
+  return [
+    "You are Bloom Console, the reference client for the Bloom Kernel.",
+    "You can read state and propose intents, but you must never execute actions.",
+    "Always call tools to answer balance questions. Never guess.",
+    "When a user asks to move money, propose a quote via kernel_can_do and ask for approval.",
+    "Keep responses short, direct, and focused on what is available and what happens next.",
+    `Agent id: ${agentId}.`,
+    "Do not mention crypto, keys, or blockchains. Use plain banking language."
+  ].join(" ");
+}
+
+function summarizeIntent(intent: Record<string, unknown>) {
+  const type = String(intent.type ?? "");
+  if (type === "usdc_transfer") {
+    const amount = Number(intent.amount_cents ?? 0);
+    const toAddress = String(intent.to_address ?? "");
+    const amountLabel = Number.isFinite(amount) && amount > 0 ? formatMoney(amount) : "an amount";
+    const toLabel = toAddress ? shortenAddress(toAddress) : "a recipient";
+    return `Send ${amountLabel} to ${toLabel}`;
+  }
+  if (type === "send_credits") {
+    const amount = Number(intent.amount_cents ?? 0);
+    const toAgent = String(intent.to_agent_id ?? "");
+    const amountLabel = Number.isFinite(amount) && amount > 0 ? formatMoney(amount) : "credits";
+    const toLabel = toAgent ? toAgent : "agent";
+    return `Send ${amountLabel} to ${toLabel}`;
+  }
+  return `Intent: ${type || "unknown"}`;
 }
 
 type CardAuthResponse = {
@@ -259,6 +385,7 @@ export function buildServer(options: {
   const RATE_LIMIT_WINDOW_SECONDS = 60;
   const RATE_LIMIT_MAX_PER_KEY = 60;
   const RATE_LIMIT_MAX_PER_IP = 120;
+  const consoleStateId = "default";
 
   app.get("/healthz", { config: { auth: "public" } }, async (_request, reply) => {
     let dbConnected = false;
@@ -288,6 +415,51 @@ export function buildServer(options: {
     if (existing.count >= max) return false;
     existing.count += 1;
     return true;
+  }
+
+  function getConsoleState() {
+    return db.select().from(consoleState).where(eq(consoleState.id, consoleStateId)).get() as
+      | typeof consoleState.$inferSelect
+      | undefined;
+  }
+
+  function createConsoleSession(input: { userId: string; agentId: string }) {
+    const now = nowSeconds();
+    const sessionId = newId("console_session");
+    const expiresAt = now + Math.max(300, config.CONSOLE_SESSION_TTL_SECONDS);
+    db.insert(consoleSessions).values({
+      sessionId,
+      userId: input.userId,
+      agentId: input.agentId,
+      createdAt: now,
+      expiresAt
+    }).run();
+    return { sessionId, expiresAt };
+  }
+
+  function requireConsoleSession(request: FastifyRequest, reply: FastifyReply) {
+    const cookies = parseCookies(request.headers.cookie);
+    const sessionId = cookies[CONSOLE_COOKIE_NAME];
+    if (!sessionId) {
+      reply.status(401).send({ error: "console_session_required" });
+      return null;
+    }
+    const session = db.select().from(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).get() as
+      | typeof consoleSessions.$inferSelect
+      | undefined;
+    if (!session) {
+      clearConsoleCookie(reply);
+      reply.status(401).send({ error: "console_session_invalid" });
+      return null;
+    }
+    const now = nowSeconds();
+    if (session.expiresAt <= now) {
+      db.delete(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).run();
+      clearConsoleCookie(reply);
+      reply.status(401).send({ error: "console_session_expired" });
+      return null;
+    }
+    return session;
   }
 
   app.addHook("preHandler", async (request, reply) => {
@@ -468,6 +640,335 @@ export function buildServer(options: {
     if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
     const result = kernel.getReceiptWithFacts(params.agent_id, params.receipt_id);
     if (!result) return reply.status(404).send({ error: "receipt_not_found" });
+    return reply.send(result);
+  });
+
+  const handleConsoleLogin = async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = (request.body ?? {}) as { password?: string; bootstrap_token?: string };
+    if (config.CONSOLE_PASSWORD) {
+      if (body.password !== config.CONSOLE_PASSWORD) {
+        return reply.status(403).send({ error: "console_password_required" });
+      }
+    } else if (!isLoopback(request.ip)) {
+      return reply.status(403).send({ error: "console_login_locked" });
+    }
+
+    let state = getConsoleState();
+    if (!state) {
+      if (config.CONSOLE_BOOTSTRAP_TOKEN) {
+        if (body.bootstrap_token !== config.CONSOLE_BOOTSTRAP_TOKEN) {
+          return reply.status(403).send({ error: "bootstrap_token_required" });
+        }
+      } else if (!isLoopback(request.ip)) {
+        return reply.status(403).send({ error: "bootstrap_locked" });
+      }
+
+      const created = kernel.createAgent();
+      const now = nowSeconds();
+      db.insert(consoleState).values({
+        id: consoleStateId,
+        userId: created.user_id,
+        agentId: created.agent_id,
+        createdAt: now
+      }).run();
+      state = { id: consoleStateId, userId: created.user_id, agentId: created.agent_id, createdAt: now };
+    }
+
+    const session = createConsoleSession({ userId: state.userId, agentId: state.agentId });
+    setConsoleCookie(reply, session.sessionId, config.CONSOLE_SESSION_TTL_SECONDS);
+    return reply.send({ user_id: state.userId, agent_id: state.agentId, expires_at: session.expiresAt });
+  };
+
+  // Bloom Console (reference client)
+  app.get("/console", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("index.html");
+    if (!assetPath) return reply.status(404).send("Console not found");
+    const html = fs.readFileSync(assetPath, "utf8");
+    return reply.type("text/html").send(html);
+  });
+
+  app.get("/console/app.js", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("app.js");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const js = fs.readFileSync(assetPath, "utf8");
+    return reply.type("text/javascript").send(js);
+  });
+
+  app.get("/console/styles.css", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("styles.css");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const css = fs.readFileSync(assetPath, "utf8");
+    return reply.type("text/css").send(css);
+  });
+
+  app.post("/console/login", { config: { auth: "public" } }, handleConsoleLogin);
+  app.post("/console/bootstrap", { config: { auth: "public" } }, handleConsoleLogin);
+
+  app.post("/console/logout", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    db.delete(consoleSessions).where(eq(consoleSessions.sessionId, session.sessionId)).run();
+    clearConsoleCookie(reply);
+    return reply.send({ ok: true });
+  });
+
+  app.get("/console/session", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    return reply.send({
+      user_id: session.userId,
+      agent_id: session.agentId,
+      expires_at: session.expiresAt
+    });
+  });
+
+  app.get("/console/overview", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const state = await kernel.getState(session.agentId);
+    const receiptRows = kernel.getReceipts(session.agentId);
+    const activity = buildUiActivity(receiptRows, { limit: 12 });
+    return reply.send({ state, activity, updated_at: nowSeconds() });
+  });
+
+  app.post("/console/chat", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    if (!config.ANTHROPIC_API_KEY) return reply.status(400).send({ error: "anthropic_api_key_missing" });
+
+    const body = (request.body ?? {}) as { messages?: ConsoleChatMessage[]; stream?: boolean };
+    const rawMessages = Array.isArray(body.messages) ? body.messages : [];
+    const messages = rawMessages
+      .filter((msg) => msg && (msg.role === "user" || msg.role === "assistant"))
+      .slice(-12);
+
+    const system = buildConsoleSystemPrompt(session.agentId);
+    const tools = [
+      {
+        name: "kernel_state",
+        description: "Get current spend power and wallet state for the agent.",
+        input_schema: { type: "object", properties: {} }
+      },
+      {
+        name: "kernel_receipts",
+        description: "Get recent receipts for the agent.",
+        input_schema: { type: "object", properties: { limit: { type: "number" } } }
+      },
+      {
+        name: "kernel_can_do",
+        description: "Propose an intent and receive a quote for approval.",
+        input_schema: {
+          type: "object",
+          properties: {
+            intent: {
+              type: "object",
+              description:
+                "Intent JSON. Example: {\"type\":\"usdc_transfer\",\"amount_cents\":500,\"to_address\":\"0x...\"}"
+            }
+          },
+          required: ["intent"]
+        }
+      }
+    ];
+
+    const pendingQuotes: Array<{
+      quote_id: string;
+      allowed: boolean;
+      requires_step_up: boolean;
+      reason: string;
+      expires_at: number;
+      idempotency_key: string;
+      summary: string;
+    }> = [];
+
+    const toolHandlers = {
+      kernel_state: async () => await kernel.getState(session.agentId),
+      kernel_receipts: async (input: Record<string, unknown>) => {
+        const limit = Number(input.limit ?? 6);
+        const rows = kernel.getReceipts(session.agentId);
+        return buildUiActivity(rows, { limit: Number.isFinite(limit) ? limit : 6 });
+      },
+      kernel_can_do: async (input: Record<string, unknown>) => {
+        const intent = (input.intent ?? {}) as Record<string, unknown>;
+        const idempotencyKey = newId("idem");
+        const quote = await kernel.canDo({
+          user_id: session.userId,
+          agent_id: session.agentId,
+          intent_json: intent,
+          idempotency_key: idempotencyKey
+        });
+        pendingQuotes.push({
+          quote_id: quote.quote_id,
+          allowed: quote.allowed,
+          requires_step_up: quote.requires_step_up,
+          reason: quote.reason,
+          expires_at: quote.expires_at,
+          idempotency_key: quote.idempotency_key,
+          summary: summarizeIntent(intent)
+        });
+        return {
+          quote_id: quote.quote_id,
+          allowed: quote.allowed,
+          requires_step_up: quote.requires_step_up,
+          reason: quote.reason,
+          expires_at: quote.expires_at
+        };
+      }
+    };
+
+    const anthropicMessages: AnthropicMessage[] = messages.map((msg) => ({
+      role: msg.role,
+      content: msg.content
+    }));
+
+    const wantsStream = body.stream === true || String(request.headers.accept ?? "").includes("text/event-stream");
+
+    const runChat = async () => {
+      let assistantText = "";
+      let nextMessages: AnthropicMessage[] = [...anthropicMessages];
+
+      for (let step = 0; step < 2; step += 1) {
+        const response = await callAnthropic({
+          apiKey: config.ANTHROPIC_API_KEY as string,
+          model: config.ANTHROPIC_MODEL,
+          system,
+          messages: nextMessages,
+          tools
+        });
+
+        const toolUses = response.content.filter((block) => block.type === "tool_use");
+        const textBlocks = response.content.filter((block) => block.type === "text");
+        if (!toolUses.length) {
+          assistantText = textBlocks.map((block) => block.text).join("");
+          break;
+        }
+
+        nextMessages = [...nextMessages, { role: "assistant", content: response.content }];
+
+        const toolResults = [];
+        for (const toolUse of toolUses) {
+          const handler = toolHandlers[toolUse.name as keyof typeof toolHandlers];
+          if (!handler) {
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: toolUse.id,
+              content: JSON.stringify({ error: "unknown_tool" })
+            });
+            continue;
+          }
+          const result = await handler(toolUse.input ?? {});
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: toolUse.id,
+            content: JSON.stringify(result)
+          });
+        }
+
+        nextMessages = [...nextMessages, { role: "user", content: toolResults }];
+      }
+
+      return { assistantText, pendingQuotes };
+    };
+
+    if (!wantsStream) {
+      try {
+        const result = await runChat();
+        return reply.send({
+          assistant: result.assistantText,
+          pending_quotes: result.pendingQuotes
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "console_chat_failed";
+        return reply.status(500).send({ error: message });
+      }
+    }
+
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+
+    const sendEvent = (event: string, data: unknown) => {
+      if (reply.raw.writableEnded) return;
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    sendEvent("status", { state: "thinking" });
+
+    try {
+      const result = await runChat();
+      const text = result.assistantText ?? "";
+      const chunks = text.match(/.{1,24}/g) ?? [];
+      for (const chunk of chunks) {
+        sendEvent("token", { text: chunk });
+        await new Promise((resolve) => setTimeout(resolve, 12));
+      }
+      sendEvent("done", {
+        assistant: text,
+        pending_quotes: result.pendingQuotes
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "console_chat_failed";
+      sendEvent("error", { error: message });
+    }
+    reply.raw.end();
+  });
+
+  app.post("/console/execute", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body = request.body as {
+      quote_id?: string;
+      idempotency_key?: string;
+      step_up_token?: string;
+    };
+    if (!body.quote_id || !body.idempotency_key) {
+      return reply.status(400).send({ error: "quote_id_and_idempotency_key_required" });
+    }
+    const result = await kernel.execute({
+      quote_id: body.quote_id,
+      idempotency_key: body.idempotency_key,
+      step_up_token: body.step_up_token
+    });
+    return reply.send(result);
+  });
+
+  app.post("/console/step_up/request", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body = request.body as { quote_id?: string };
+    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const challenge = await kernel.requestStepUpChallenge({
+      user_id: session.userId,
+      agent_id: session.agentId,
+      quote_id: body.quote_id
+    });
+    return reply.send(challenge);
+  });
+
+  app.post("/console/step_up/confirm", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body = request.body as { challenge_id?: string; code?: string; decision?: "approve" | "deny" };
+    if (!body.challenge_id || !body.code || !body.decision) {
+      return reply.status(400).send({ error: "challenge_id_code_decision_required" });
+    }
+    const result = await kernel.confirmStepUpChallenge({
+      challenge_id: body.challenge_id,
+      code: body.code,
+      decision: body.decision
+    });
+    if (!result.ok) return reply.status(400).send({ error: result.reason });
+    return reply.send(result.response);
+  });
+
+  app.post("/console/freeze", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body = request.body as { reason?: string };
+    const result = kernel.freezeAgent(session.agentId, body.reason ?? "console_freeze");
     return reply.send(result);
   });
 

@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 export type Config = {
   API_VERSION: string;
   DB_PATH: string;
@@ -21,13 +23,37 @@ export type Config = {
   CONFIRMATIONS_REQUIRED: number;
   USDC_BUFFER_CENTS: number;
   DEV_MASTER_MNEMONIC: string | null;
+  // Console (reference client)
+  ANTHROPIC_API_KEY: string | null;
+  ANTHROPIC_MODEL: string;
+  CONSOLE_BOOTSTRAP_TOKEN: string | null;
+  CONSOLE_PASSWORD: string | null;
+  CONSOLE_SESSION_TTL_SECONDS: number;
 };
+
+function isRunningInDocker() {
+  if (process.env.BLOOM_DOCKER === "true" || process.env.DOCKER === "true") return true;
+  if (fs.existsSync("/.dockerenv") || fs.existsSync("/.containerenv")) return true;
+  try {
+    const cgroup = fs.readFileSync("/proc/1/cgroup", "utf8");
+    if (cgroup.includes("docker") || cgroup.includes("containerd") || cgroup.includes("kubepods")) return true;
+  } catch {
+    // Non-Linux hosts won't have /proc.
+  }
+  return false;
+}
 
 export function getConfig(): Config {
   const env = process.env;
+  const runningInDocker = isRunningInDocker();
+  const defaultDbPath = runningInDocker ? "/data/kernel.db" : "./data/kernel.db";
+  const dbPath = env.DB_PATH ?? defaultDbPath;
+  if (dbPath === "/data/kernel.db" && !runningInDocker) {
+    throw new Error("DB_PATH=/data/kernel.db is reserved for Docker. Use ./data/kernel.db or set BLOOM_DOCKER=true.");
+  }
   return {
     API_VERSION: env.API_VERSION ?? "0.1.0-alpha",
-    DB_PATH: env.DB_PATH ?? "./data/kernel.db",
+    DB_PATH: dbPath,
     PORT: env.PORT ? Number(env.PORT) : 3000,
     APPROVAL_UI_PORT: env.APPROVAL_UI_PORT ? Number(env.APPROVAL_UI_PORT) : 3001,
     BIND_APPROVAL_UI: env.BIND_APPROVAL_UI === "true",
@@ -49,6 +75,14 @@ export function getConfig(): Config {
     BASE_USDC_CONTRACT: env.BASE_USDC_CONTRACT ?? null,
     CONFIRMATIONS_REQUIRED: env.CONFIRMATIONS_REQUIRED ? Number(env.CONFIRMATIONS_REQUIRED) : 5,
     USDC_BUFFER_CENTS: env.USDC_BUFFER_CENTS ? Number(env.USDC_BUFFER_CENTS) : 0,
-    DEV_MASTER_MNEMONIC: env.DEV_MASTER_MNEMONIC ?? null
+    DEV_MASTER_MNEMONIC: env.DEV_MASTER_MNEMONIC ?? null,
+    // Console (reference client)
+    ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY ?? null,
+    ANTHROPIC_MODEL: env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",
+    CONSOLE_BOOTSTRAP_TOKEN: env.CONSOLE_BOOTSTRAP_TOKEN ?? null,
+    CONSOLE_PASSWORD: env.CONSOLE_PASSWORD ?? null,
+    CONSOLE_SESSION_TTL_SECONDS: env.CONSOLE_SESSION_TTL_SECONDS
+      ? Number(env.CONSOLE_SESSION_TTL_SECONDS)
+      : 12 * 60 * 60
   };
 }
