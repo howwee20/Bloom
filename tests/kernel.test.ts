@@ -9,6 +9,100 @@ function getSingleJob(db: ReturnType<typeof createTestContext>["db"]) {
 }
 
 describe("Constraint Kernel", () => {
+  it("enforces receipts append-only at the DB level", async () => {
+    const { sqlite, kernel } = createTestContext();
+    const { agent_id } = kernel.createAgent();
+    const row = sqlite
+      .prepare("SELECT receipt_id FROM receipts WHERE agent_id = ? ORDER BY rowid ASC LIMIT 1")
+      .get(agent_id) as { receipt_id?: string } | undefined;
+    expect(row?.receipt_id).toBeTruthy();
+    const receiptId = row?.receipt_id ?? "";
+
+    expect(() => {
+      sqlite
+        .prepare("UPDATE receipts SET what_happened = ? WHERE receipt_id = ?")
+        .run("tamper", receiptId);
+    }).toThrow();
+    expect(() => {
+      sqlite.prepare("DELETE FROM receipts WHERE receipt_id = ?").run(receiptId);
+    }).toThrow();
+  });
+
+  it("emits an event+receipt when creating an agent", async () => {
+    const { sqlite, kernel } = createTestContext();
+    const eventsBefore = sqlite.prepare("SELECT COUNT(1) as count FROM events").get() as { count: number };
+    const receiptsBefore = sqlite.prepare("SELECT COUNT(1) as count FROM receipts").get() as { count: number };
+    const { agent_id, user_id } = kernel.createAgent();
+
+    const eventRow = sqlite
+      .prepare("SELECT * FROM events WHERE agent_id = ? AND type = ?")
+      .get(agent_id, "kernel.agent_created") as { event_id?: string; payload_json?: string } | undefined;
+    expect(eventRow?.event_id).toBeTruthy();
+    const receiptRow = sqlite
+      .prepare("SELECT * FROM receipts WHERE agent_id = ? AND event_id = ?")
+      .get(agent_id, eventRow?.event_id ?? "") as { receipt_id?: string } | undefined;
+    expect(receiptRow?.receipt_id).toBeTruthy();
+
+    const payload = eventRow?.payload_json ? JSON.parse(eventRow.payload_json) : {};
+    expect(payload.user_id).toBe(user_id);
+    expect(payload.agent_id).toBe(agent_id);
+
+    const eventsAfter = sqlite.prepare("SELECT COUNT(1) as count FROM events").get() as { count: number };
+    const receiptsAfter = sqlite.prepare("SELECT COUNT(1) as count FROM receipts").get() as { count: number };
+    expect(eventsAfter.count).toBe(eventsBefore.count + 1);
+    expect(receiptsAfter.count).toBe(receiptsBefore.count + 1);
+  });
+
+  it("emits an event+receipt when daily spend counters reset", async () => {
+    const { db, sqlite, kernel } = createTestContext();
+    const { agent_id, user_id } = kernel.createAgent();
+
+    db.update(budgets)
+      .set({ dailySpendUsedCents: 123, lastResetAt: 0 })
+      .where(eq(budgets.agentId, agent_id))
+      .run();
+
+    const before = sqlite
+      .prepare("SELECT COUNT(1) as count FROM events WHERE agent_id = ? AND type = ?")
+      .get(agent_id, "kernel.daily_reset") as { count: number };
+
+    const quote = await kernel.canDo({ user_id, agent_id, intent_json: { type: "request_job" } });
+    expect(quote.allowed).toBe(true);
+
+    const after = sqlite
+      .prepare("SELECT COUNT(1) as count FROM events WHERE agent_id = ? AND type = ?")
+      .get(agent_id, "kernel.daily_reset") as { count: number };
+    expect(after.count).toBe(before.count + 1);
+
+    const resetEvent = sqlite
+      .prepare("SELECT event_id FROM events WHERE agent_id = ? AND type = ?")
+      .get(agent_id, "kernel.daily_reset") as { event_id?: string } | undefined;
+    const resetReceipt = sqlite
+      .prepare("SELECT receipt_id FROM receipts WHERE agent_id = ? AND event_id = ?")
+      .get(agent_id, resetEvent?.event_id ?? "") as { receipt_id?: string } | undefined;
+    expect(resetReceipt?.receipt_id).toBeTruthy();
+
+    const budget = db.select().from(budgets).where(eq(budgets.agentId, agent_id)).get();
+    expect(budget?.dailySpendUsedCents).toBe(0);
+  });
+
+  it("fails closed on stale/unknown freshness for can_do", async () => {
+    const { db, kernel } = createTestContext({ ENV_STALE_SECONDS: 1, ENV_UNKNOWN_SECONDS: 2 });
+    const { user_id, agent_id } = kernel.createAgent();
+    const now = Math.floor(Date.now() / 1000);
+    db.insert(envHealth).values({
+      envName: "simple_economy",
+      status: "unknown",
+      lastOkAt: now - 500,
+      lastTickAt: now - 500,
+      updatedAt: now - 500
+    }).run();
+
+    const quote = await kernel.canDo({ user_id, agent_id, intent_json: { type: "request_job" } });
+    expect(quote.allowed).toBe(false);
+    expect(quote.reason).toMatch(/^env_/);
+  });
+
   it("enforces append-only audit chain and validates hashes", async () => {
     const { db, sqlite, kernel } = createTestContext();
     const { user_id, agent_id } = kernel.createAgent();

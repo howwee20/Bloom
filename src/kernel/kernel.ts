@@ -199,6 +199,42 @@ export class Kernel {
     this.config = config;
   }
 
+  private appendEventWithReceipt(input: {
+    agentId: string;
+    userId: string;
+    type: string;
+    payload: Record<string, unknown>;
+    occurredAt?: number;
+    receipt: {
+      source: "policy" | "execution" | "env" | "repair";
+      externalRef?: string | null;
+      whatHappened: string;
+      whyChanged: string;
+      whatHappensNext: string;
+      occurredAt?: number;
+    };
+  }) {
+    const event = appendEvent(this.db, this.sqlite, {
+      agentId: input.agentId,
+      userId: input.userId,
+      type: input.type,
+      payload: input.payload,
+      occurredAt: input.occurredAt
+    });
+    const receipt = createReceipt(this.db, {
+      agentId: input.agentId,
+      userId: input.userId,
+      source: input.receipt.source,
+      eventId: event.event_id,
+      externalRef: input.receipt.externalRef ?? null,
+      whatHappened: input.receipt.whatHappened,
+      whyChanged: input.receipt.whyChanged,
+      whatHappensNext: input.receipt.whatHappensNext,
+      occurredAt: input.receipt.occurredAt ?? event.occurred_at
+    });
+    return { event, receipt };
+  }
+
   private computePolicySpendable(
     budget: typeof budgets.$inferSelect,
     policy: PolicyShape,
@@ -255,27 +291,17 @@ export class Kernel {
     const now = nowSeconds();
     const userId = input.userId ?? newId("user");
     const agentId = input.agentId ?? newId("agent");
-    const user = this.db.select().from(users).where(eq(users.userId, userId)).get();
-    if (!user) {
-      this.db.insert(users).values({ userId, createdAt: now }).run();
+    const existingAgent = this.db.select().from(agents).where(eq(agents.agentId, agentId)).get() as
+      | typeof agents.$inferSelect
+      | undefined;
+    if (existingAgent) {
+      if (existingAgent.userId !== userId) {
+        throw new Error("agent_id_in_use");
+      }
+      return { user_id: existingAgent.userId, agent_id: existingAgent.agentId };
     }
-    this.db.insert(agents).values({
-      agentId,
-      userId,
-      status: "active",
-      createdAt: now,
-      updatedAt: now
-    }).run();
 
-    this.db.insert(budgets).values({
-      agentId,
-      creditsCents: this.config.DEFAULT_CREDITS_CENTS,
-      dailySpendCents: this.config.DEFAULT_DAILY_SPEND_CENTS,
-      dailySpendUsedCents: 0,
-      lastResetAt: dayStartEpoch(now),
-      updatedAt: now
-    }).run();
-
+    const dayStart = dayStartEpoch(now);
     const defaultPolicy: PolicyShape = {
       per_intent_limit: {
         request_job: { max_per_day: 20 },
@@ -293,24 +319,74 @@ export class Kernel {
       defaultPolicy.allowlist = [...defaultPolicy.allowlist, "usdc_transfer"];
     }
 
-    this.db.insert(policies).values({
-      policyId: newId("policy"),
-      userId,
-      agentId,
-      perIntentLimitJson: defaultPolicy.per_intent_limit,
-      dailyLimitJson: defaultPolicy.daily_limit,
-      allowlistJson: defaultPolicy.allowlist,
-      blocklistJson: defaultPolicy.blocklist,
-      stepUpThresholdJson: defaultPolicy.step_up_threshold,
-      createdAt: now
-    }).run();
+    const tx = this.sqlite.transaction(() => {
+      const user = this.db.select().from(users).where(eq(users.userId, userId)).get();
+      const createdUser = !user;
+      if (!user) {
+        this.db.insert(users).values({ userId, createdAt: now }).run();
+      }
+      this.db.insert(agents).values({
+        agentId,
+        userId,
+        status: "active",
+        createdAt: now,
+        updatedAt: now
+      }).run();
 
-    refreshAgentSpendSnapshot({
-      db: this.db,
-      sqlite: this.sqlite,
-      config: this.config,
-      agentId
+      this.db.insert(budgets).values({
+        agentId,
+        creditsCents: this.config.DEFAULT_CREDITS_CENTS,
+        dailySpendCents: this.config.DEFAULT_DAILY_SPEND_CENTS,
+        dailySpendUsedCents: 0,
+        lastResetAt: dayStart,
+        updatedAt: now
+      }).run();
+
+      this.db.insert(policies).values({
+        policyId: newId("policy"),
+        userId,
+        agentId,
+        perIntentLimitJson: defaultPolicy.per_intent_limit,
+        dailyLimitJson: defaultPolicy.daily_limit,
+        allowlistJson: defaultPolicy.allowlist,
+        blocklistJson: defaultPolicy.blocklist,
+        stepUpThresholdJson: defaultPolicy.step_up_threshold,
+        createdAt: now
+      }).run();
+
+      refreshAgentSpendSnapshot({
+        db: this.db,
+        sqlite: this.sqlite,
+        config: this.config,
+        agentId
+      });
+
+      this.appendEventWithReceipt({
+        agentId,
+        userId,
+        type: "kernel.agent_created",
+        payload: {
+          user_id: userId,
+          agent_id: agentId,
+          created_at: now,
+          created_user: createdUser,
+          defaults: {
+            credits_cents: this.config.DEFAULT_CREDITS_CENTS,
+            daily_spend_cents: this.config.DEFAULT_DAILY_SPEND_CENTS,
+            daily_spend_used_cents: 0,
+            last_reset_at: dayStart,
+            policy: defaultPolicy
+          }
+        },
+        receipt: {
+          source: "policy",
+          whatHappened: "Agent created.",
+          whyChanged: "kernel.agent_created",
+          whatHappensNext: "Agent can request quotes."
+        }
+      });
     });
+    tx();
 
     return { user_id: userId, agent_id: agentId };
   }
@@ -340,11 +416,48 @@ export class Kernel {
     if (!budget) return;
     const dayStart = dayStartEpoch(now);
     if (budget.lastResetAt < dayStart) {
-      this.db
-        .update(budgets)
-        .set({ dailySpendUsedCents: 0, lastResetAt: dayStart, updatedAt: now })
-        .where(eq(budgets.agentId, agentId))
-        .run();
+      const agent = this.db.select().from(agents).where(eq(agents.agentId, agentId)).get() as
+        | typeof agents.$inferSelect
+        | undefined;
+      if (!agent) return;
+      const prev = {
+        daily_spend_used_cents: budget.dailySpendUsedCents,
+        daily_spend_cents: budget.dailySpendCents,
+        last_reset_at: budget.lastResetAt
+      };
+      const next = {
+        daily_spend_used_cents: 0,
+        daily_spend_cents: budget.dailySpendCents,
+        last_reset_at: dayStart
+      };
+      const tx = this.sqlite.transaction(() => {
+        this.db
+          .update(budgets)
+          .set({ dailySpendUsedCents: 0, lastResetAt: dayStart, updatedAt: now })
+          .where(eq(budgets.agentId, agentId))
+          .run();
+        this.appendEventWithReceipt({
+          agentId,
+          userId: agent.userId,
+          type: "kernel.daily_reset",
+          payload: {
+            agent_id: agentId,
+            user_id: agent.userId,
+            occurred_at: now,
+            day_start: dayStart,
+            previous: prev,
+            next
+          },
+          receipt: {
+            source: "policy",
+            whatHappened: "Daily counters reset (UTC day rollover).",
+            whyChanged: "kernel.daily_reset",
+            whatHappensNext: "Daily spend budget renewed.",
+            occurredAt: now
+          }
+        });
+      });
+      tx();
     }
   }
 
