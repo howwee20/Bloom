@@ -40,8 +40,9 @@ body {
 }
 
 .wordmark {
-  font-family: "Zen Dots", "Inter", sans-serif;
+  font-family: "Zen Dots", "ZenDots", "Zen Dots Regular", "Inter", sans-serif;
   font-size: 20px;
+  font-weight: 400;
   letter-spacing: 0.06em;
 }
 
