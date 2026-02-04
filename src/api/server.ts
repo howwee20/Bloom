@@ -364,6 +364,31 @@ function migrationsApplied(sqlite: Database) {
   }
 }
 
+function getDatabaseFile(sqlite: Database) {
+  try {
+    const rows = sqlite.prepare("PRAGMA database_list").all() as { name: string; file?: string }[];
+    const main = rows.find((row) => row.name === "main");
+    return main?.file ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function assertTableExists(sqlite: Database, table: string, label: string) {
+  try {
+    const row = sqlite
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+      .get(table) as { name?: string } | undefined;
+    if (!row?.name) {
+      const file = getDatabaseFile(sqlite) ?? "unknown";
+      throw new Error(`${label} missing table '${table}'. file=${file}`);
+    }
+  } catch (error) {
+    if (error instanceof Error) throw error;
+    throw new Error(`${label} schema check failed for '${table}'.`);
+  }
+}
+
 export function buildServer(options: {
   config?: ReturnType<typeof getConfig>;
   db?: DbClient;
@@ -391,6 +416,7 @@ export function buildServer(options: {
         ? { sqlite, db }
         : createDatabase(consoleDbPath);
   const consoleDb = consoleDbBundle.db;
+  const consoleSqlite = consoleDbBundle.sqlite;
 
   const env =
     options.env ??
@@ -398,6 +424,11 @@ export function buildServer(options: {
       ? new BaseUsdcWorld(db, sqlite, config)
       : new SimpleEconomyWorld(db, sqlite, config));
   const kernel = new Kernel(db, sqlite, env, config);
+
+  assertTableExists(sqlite, "agents", "Kernel DB");
+  if (consoleDbPath !== config.DB_PATH) {
+    assertTableExists(consoleSqlite, "console_sessions", "Console DB");
+  }
 
   const app = Fastify({ logger: true });
 
@@ -832,6 +863,8 @@ export function buildServer(options: {
     if (!agentRow) {
       return reply.send({
         db_path: config.DB_PATH,
+        kernel_db_file: getDatabaseFile(sqlite),
+        console_db_file: getDatabaseFile(consoleSqlite),
         agent_id: null,
         wallet_address: null,
         confirmed_cents: null,
@@ -845,6 +878,8 @@ export function buildServer(options: {
     const walletAddress = typeof observation?.wallet_address === "string" ? observation.wallet_address : null;
     return reply.send({
       db_path: config.DB_PATH,
+      kernel_db_file: getDatabaseFile(sqlite),
+      console_db_file: getDatabaseFile(consoleSqlite),
       agent_id: agentId,
       wallet_address: walletAddress,
       confirmed_cents: (spend as { confirmed_balance_cents?: number }).confirmed_balance_cents ?? null,
