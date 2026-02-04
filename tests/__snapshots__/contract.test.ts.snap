@@ -3,7 +3,7 @@
 exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > receipt 1`] = `
 {
   "event": {
-    "event_id": "evt_00000000-0000-0000-0000-000000000008",
+    "event_id": "evt_00000000-0000-0000-0000-000000000010",
     "payload": {
       "agent_id": "agent_contract",
       "auth_id": "A2",
@@ -38,10 +38,10 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
   "receipt": {
     "agentId": "agent_contract",
     "createdAt": 1735689640,
-    "eventId": "evt_00000000-0000-0000-0000-000000000008",
+    "eventId": "evt_00000000-0000-0000-0000-000000000010",
     "externalRef": "A2",
     "occurredAt": 1735689640,
-    "receiptId": "rcpt_00000000-0000-0000-0000-000000000009",
+    "receiptId": "rcpt_00000000-0000-0000-0000-000000000011",
     "source": "policy",
     "userId": "user_contract",
     "whatHappened": "Card hold released.",
@@ -59,10 +59,10 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
     {
       "agentId": "agent_contract",
       "createdAt": 1735689640,
-      "eventId": "evt_00000000-0000-0000-0000-000000000008",
+      "eventId": "evt_00000000-0000-0000-0000-000000000010",
       "externalRef": "A2",
       "occurredAt": 1735689640,
-      "receiptId": "rcpt_00000000-0000-0000-0000-000000000009",
+      "receiptId": "rcpt_00000000-0000-0000-0000-000000000011",
       "source": "policy",
       "userId": "user_contract",
       "whatHappened": "Card hold released.",
@@ -72,10 +72,10 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
     {
       "agentId": "agent_contract",
       "createdAt": 1735689630,
-      "eventId": "evt_00000000-0000-0000-0000-000000000006",
+      "eventId": "evt_00000000-0000-0000-0000-000000000008",
       "externalRef": "A1",
       "occurredAt": 1735689630,
-      "receiptId": "rcpt_00000000-0000-0000-0000-000000000007",
+      "receiptId": "rcpt_00000000-0000-0000-0000-000000000009",
       "source": "policy",
       "userId": "user_contract",
       "whatHappened": "Card hold settled.",
@@ -85,10 +85,10 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
     {
       "agentId": "agent_contract",
       "createdAt": 1735689620,
-      "eventId": "evt_00000000-0000-0000-0000-000000000004",
+      "eventId": "evt_00000000-0000-0000-0000-000000000006",
       "externalRef": "A2",
       "occurredAt": 1735689620,
-      "receiptId": "rcpt_00000000-0000-0000-0000-000000000005",
+      "receiptId": "rcpt_00000000-0000-0000-0000-000000000007",
       "source": "policy",
       "userId": "user_contract",
       "whatHappened": "Card auth observed in shadow mode.",
@@ -98,15 +98,28 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
     {
       "agentId": "agent_contract",
       "createdAt": 1735689610,
-      "eventId": "evt_00000000-0000-0000-0000-000000000002",
+      "eventId": "evt_00000000-0000-0000-0000-000000000004",
       "externalRef": "A1",
       "occurredAt": 1735689610,
-      "receiptId": "rcpt_00000000-0000-0000-0000-000000000003",
+      "receiptId": "rcpt_00000000-0000-0000-0000-000000000005",
       "source": "policy",
       "userId": "user_contract",
       "whatHappened": "Card auth observed in shadow mode.",
       "whatHappensNext": "Hold recorded; shadow decision logged.",
       "whyChanged": "shadow_would_approve",
+    },
+    {
+      "agentId": "agent_contract",
+      "createdAt": 1735689600,
+      "eventId": "evt_00000000-0000-0000-0000-000000000002",
+      "externalRef": null,
+      "occurredAt": 1735689600,
+      "receiptId": "rcpt_00000000-0000-0000-0000-000000000003",
+      "source": "policy",
+      "userId": "user_contract",
+      "whatHappened": "Agent created.",
+      "whatHappensNext": "Agent can request quotes.",
+      "whyChanged": "kernel.agent_created",
     },
   ],
   "reserved_outgoing_cents": 0,
@@ -118,7 +131,7 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
 {
   "timeline": [
     {
-      "id": "evt_00000000-0000-0000-0000-000000000008",
+      "id": "evt_00000000-0000-0000-0000-000000000010",
       "kind": "event",
       "payload": {
         "agent_id": "agent_contract",
@@ -142,9 +155,9 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "type": "card_released",
     },
     {
-      "event_id": "evt_00000000-0000-0000-0000-000000000008",
+      "event_id": "evt_00000000-0000-0000-0000-000000000010",
       "external_ref": "A2",
-      "id": "rcpt_00000000-0000-0000-0000-000000000009",
+      "id": "rcpt_00000000-0000-0000-0000-000000000011",
       "kind": "receipt",
       "ts": 1735689640,
       "type": "policy",
@@ -153,7 +166,7 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "why_changed": "card_released",
     },
     {
-      "id": "evt_00000000-0000-0000-0000-000000000006",
+      "id": "evt_00000000-0000-0000-0000-000000000008",
       "kind": "event",
       "payload": {
         "agent_id": "agent_contract",
@@ -178,9 +191,9 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "type": "card_settled",
     },
     {
-      "event_id": "evt_00000000-0000-0000-0000-000000000006",
+      "event_id": "evt_00000000-0000-0000-0000-000000000008",
       "external_ref": "A1",
-      "id": "rcpt_00000000-0000-0000-0000-000000000007",
+      "id": "rcpt_00000000-0000-0000-0000-000000000009",
       "kind": "receipt",
       "ts": 1735689630,
       "type": "policy",
@@ -189,7 +202,7 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "why_changed": "card_settled",
     },
     {
-      "id": "evt_00000000-0000-0000-0000-000000000004",
+      "id": "evt_00000000-0000-0000-0000-000000000006",
       "kind": "event",
       "payload": {
         "agent_id": "agent_contract",
@@ -242,9 +255,9 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "type": "card_auth_shadow",
     },
     {
-      "event_id": "evt_00000000-0000-0000-0000-000000000004",
+      "event_id": "evt_00000000-0000-0000-0000-000000000006",
       "external_ref": "A2",
-      "id": "rcpt_00000000-0000-0000-0000-000000000005",
+      "id": "rcpt_00000000-0000-0000-0000-000000000007",
       "kind": "receipt",
       "ts": 1735689620,
       "type": "policy",
@@ -253,7 +266,7 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "why_changed": "shadow_would_approve",
     },
     {
-      "id": "evt_00000000-0000-0000-0000-000000000002",
+      "id": "evt_00000000-0000-0000-0000-000000000004",
       "kind": "event",
       "payload": {
         "agent_id": "agent_contract",
@@ -306,15 +319,73 @@ exports[`Kernel contract snapshots > matches summary/timeline/receipt outputs > 
       "type": "card_auth_shadow",
     },
     {
-      "event_id": "evt_00000000-0000-0000-0000-000000000002",
+      "event_id": "evt_00000000-0000-0000-0000-000000000004",
       "external_ref": "A1",
-      "id": "rcpt_00000000-0000-0000-0000-000000000003",
+      "id": "rcpt_00000000-0000-0000-0000-000000000005",
       "kind": "receipt",
       "ts": 1735689610,
       "type": "policy",
       "what_happened": "Card auth observed in shadow mode.",
       "what_happens_next": "Hold recorded; shadow decision logged.",
       "why_changed": "shadow_would_approve",
+    },
+    {
+      "id": "evt_00000000-0000-0000-0000-000000000002",
+      "kind": "event",
+      "payload": {
+        "agent_id": "agent_contract",
+        "created_at": 1735689600,
+        "created_user": false,
+        "defaults": {
+          "credits_cents": 50000,
+          "daily_spend_cents": 50000,
+          "daily_spend_used_cents": 0,
+          "last_reset_at": 1735689600,
+          "policy": {
+            "allowlist": [
+              "request_job",
+              "submit_job",
+              "buy_tool",
+              "send_credits",
+            ],
+            "blocklist": [],
+            "daily_limit": {
+              "max_spend_cents": 50000,
+            },
+            "per_intent_limit": {
+              "buy_tool": {
+                "max_per_day": 5,
+              },
+              "request_job": {
+                "max_per_day": 20,
+              },
+              "send_credits": {
+                "max_per_day": 10,
+              },
+              "submit_job": {
+                "max_per_day": 50,
+              },
+            },
+            "step_up_threshold": {
+              "spend_cents": 1000,
+            },
+          },
+        },
+        "user_id": "user_contract",
+      },
+      "ts": 1735689600,
+      "type": "kernel.agent_created",
+    },
+    {
+      "event_id": "evt_00000000-0000-0000-0000-000000000002",
+      "external_ref": null,
+      "id": "rcpt_00000000-0000-0000-0000-000000000003",
+      "kind": "receipt",
+      "ts": 1735689600,
+      "type": "policy",
+      "what_happened": "Agent created.",
+      "what_happens_next": "Agent can request quotes.",
+      "why_changed": "kernel.agent_created",
     },
   ],
 }

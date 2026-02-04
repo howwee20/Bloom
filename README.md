@@ -3,7 +3,7 @@
 Provider-agnostic constraint runtime for agents in a persistent environment.
 
 Key rules
-- Fail closed by default: if environment freshness is stale/unknown, execution is rejected unless `override_freshness` is explicitly set.
+- Fail closed by default: if environment freshness is stale/unknown, `can_do` and `execute` are rejected; `execute` may be overridden via `override_freshness`.
 - Irreversible truth: append-only event log with hash chaining.
 - Idempotent and auditable: quotes, executions, receipts, and deterministic env state.
 - Consequences without suffering: loss of future options, budget, or time (no “pain”).
@@ -14,12 +14,13 @@ Key rules
 This contract defines the stable syscall surface and invariants for the kernel. Changes require a version bump.
 
 Kernel laws
-- Membrane: external side effects only occur via environment actions; kernel state changes only via events/receipts.
+- Membrane: external side effects only occur via environment actions; authoritative kernel mutations are logged via events/receipts (derived caches may update without their own events).
 - Append-only: events and receipts are immutable; new truth is additive.
+- Receipts are immutable: corrections are appended as new receipts (no mutation).
 - Deterministic replay: replaying the event log yields the same state and receipts.
 - Idempotency: repeated calls with the same idempotency key do not create duplicate effects.
 - Conservative bounds: spend power uses the tightest applicable limits (policy, balance, reserves).
-- Fail-closed: stale/unknown environment freshness rejects execution unless explicitly overridden.
+- Fail-closed: stale/unknown environment freshness rejects `can_do` and `execute`; `execute` may be explicitly overridden with `override_freshness`.
 - Sovereignty: agents are isolated; policy/budget state never crosses agent boundaries.
 - Grounded receipts: every receipt references causal facts (event + snapshot) for auditability.
 
@@ -78,6 +79,33 @@ curl http://localhost:3000/healthz
 ```
 
 Expected output:
+
+```json
+{"api_version":"0.1.0-alpha","db_connected":true,"migrations_applied":true,"card_mode":"dev","env_type":"base_usdc","git_sha":null}
+```
+
+## Bloom Console (Reference Client v0)
+
+The console is a lightweight web client that talks to the kernel via the public API and uses Claude Sonnet as the planner. It does **not** modify kernel behavior.
+
+### Prerequisites
+
+- Set `ANTHROPIC_API_KEY` in `.env`
+- Optional: set `CONSOLE_BOOTSTRAP_TOKEN` to require a bootstrap code for new accounts
+
+### Run
+
+```bash
+pnpm dev
+```
+
+Open `http://localhost:3000/console`.
+
+### Notes
+
+- "Create Bloom" uses a local bootstrap endpoint to mint a user, agent, and API key.
+- "Add money" shows the agent wallet address (Base USDC env).
+- The assistant only proposes actions; execution always requires explicit approval.
 ```json
 {
   "api_version": "0.1.0-alpha",
@@ -124,10 +152,60 @@ Expected final output: `=== SMOKE TEST PASSED ===`
 
 For development without Docker:
 
+### Prerequisites
+
+- **Node.js 20.x or 22.x** (NOT Node 24 - causes native module issues)
+- **pnpm** (installed via corepack)
+
 ```bash
+# Use correct Node version (check .nvmrc)
+nvm use
+
+# Verify versions
+node -v    # Should show v20.x or v22.x
+pnpm -v    # Should show 9.x or 10.x
+
+# If pnpm is missing:
+corepack enable
+corepack prepare pnpm@latest --activate
+```
+
+### Setup
+
+```bash
+# Install dependencies (rebuilds native modules for your Node version)
 pnpm install
+
+# Copy environment file
+cp .env.example .env
+
+# Run migrations
 pnpm migrate
+
+# Validate environment
+pnpm doctor
+
+# Start server
 pnpm dev
+```
+
+### Troubleshooting
+
+If you see `NODE_MODULE_VERSION` errors (e.g., "compiled against 115, requires 137"):
+
+```bash
+# You're running the wrong Node version. Fix:
+nvm use 20
+rm -rf node_modules
+pnpm install
+```
+
+If `tsx: command not found`:
+
+```bash
+# Dependencies didn't install properly. Fix:
+rm -rf node_modules pnpm-lock.yaml
+pnpm install
 ```
 
 ## Env vars
@@ -281,9 +359,11 @@ Edit your Claude Desktop config file:
 {
   "mcpServers": {
     "bloom": {
-      "command": "pnpm",
-      "args": ["mcp"],
-      "cwd": "/path/to/Bloom",
+      "command": "bash",
+      "args": [
+        "-lc",
+        "export NVM_DIR=\"$HOME/.nvm\"; [ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"; nvm use 20 >/dev/null; cd /path/to/Bloom; node --no-warnings --loader tsx src/mcp/server.ts"
+      ],
       "env": {
         "BLOOM_BASE_URL": "http://localhost:3000",
         "BLOOM_READ_KEY": "your_read_only_api_key",
@@ -294,7 +374,7 @@ Edit your Claude Desktop config file:
 }
 ```
 
-Replace `/path/to/Bloom` with your actual repo path.
+Replace `/path/to/Bloom` with your actual repo path. This avoids pnpm/tsx banners on stdout, keeping the MCP protocol clean.
 
 ### Step 3: Restart Claude Desktop
 
@@ -365,6 +445,33 @@ Expected output: JSON with agent state.
 ```bash
 pnpm replay --agent_id=agent_1
 ```
+
+## Lithic Integration (Card Sandbox)
+
+Scripts for testing card authorization flows with Lithic sandbox.
+
+### Prerequisites
+
+Add to your `.env`:
+```bash
+LITHIC_API_KEY=your_sandbox_api_key
+PUBLIC_BLOOM_URL=https://your-ngrok-url.ngrok.app
+```
+
+### Commands
+
+```bash
+# Bootstrap: enrolls ASA endpoint with Lithic, retrieves HMAC secret
+pnpm lithic:bootstrap
+
+# Create card: creates a virtual card in Lithic sandbox
+pnpm lithic:card:create
+
+# Simulate: runs 100 auth simulations through the card
+pnpm lithic:simulate:100
+```
+
+Scripts automatically load `.env` - no need to source manually.
 
 ## Run Base USDC reconciliation worker
 
