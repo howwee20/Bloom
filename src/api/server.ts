@@ -174,6 +174,12 @@ function resolveConsoleAsset(assetName: string) {
   return null;
 }
 
+function setNoCache(reply: FastifyReply) {
+  reply.header("cache-control", "no-store, max-age=0");
+  reply.header("pragma", "no-cache");
+  reply.header("expires", "0");
+}
+
 function parseCookies(header: string | undefined) {
   const out: Record<string, string> = {};
   if (!header) return out;
@@ -684,6 +690,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("index.html");
     if (!assetPath) return reply.status(404).send("Console not found");
     const html = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/html").send(html);
   });
 
@@ -691,6 +698,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("app.js");
     if (!assetPath) return reply.status(404).send("Not found");
     const js = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/javascript").send(js);
   });
 
@@ -698,6 +706,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("styles.css");
     if (!assetPath) return reply.status(404).send("Not found");
     const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/css").send(css);
   });
 
