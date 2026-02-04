@@ -3,6 +3,9 @@
   "version": "0.1.0-alpha",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=20.0.0 <21.0.0 || >=22.0.0 <23.0.0"
+  },
   "pnpm": {
     "onlyBuiltDependencies": [
       "better-sqlite3",
@@ -14,14 +17,24 @@
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/api/server.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "console:first-run": "tsx scripts/console_first_run.ts",
     "test": "vitest run",
     "replay": "tsx src/workers/replay.ts",
     "release:alpha": "pnpm install && pnpm test && node scripts/release_tag.cjs",
     "worker:base_usdc": "tsx src/workers/reconcile_base_usdc.ts",
     "mcp": "tsx src/mcp/server.ts",
-    "mcp:smoke": "tsx scripts/mcp_smoke_test.ts"
+    "mcp:smoke": "tsx scripts/mcp_smoke_test.ts",
+    "lithic:bootstrap": "tsx scripts/lithic-bootstrap.ts",
+    "lithic:card:create": "tsx scripts/lithic-card-create.ts",
+    "lithic:simulate:100": "tsx scripts/lithic-simulate.ts",
+    "doctor": "tsx scripts/doctor.ts",
+    "preflight": "tsx scripts/preflight.ts",
+    "keys:mint": "tsx scripts/keys_mint.ts",
+    "agent:init": "tsx scripts/agent_init.ts",
+    "env:print": "tsx scripts/env_print.ts"
   },
   "dependencies": {
+    "dotenv": "^16.4.5",
     "@modelcontextprotocol/sdk": "^0.6.0",
     "better-sqlite3": "^9.4.5",
     "drizzle-orm": "^0.38.2",

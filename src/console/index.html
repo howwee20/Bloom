@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bloom Console</title>
+    <link rel="stylesheet" href="/console/styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <div class="header__left">
+          <div class="wordmark">Bloom</div>
+          <div class="availability">
+            <span class="availability__label">Available</span>
+            <span class="availability__value" id="availableValue">$0.00</span>
+          </div>
+          <div class="availability__updated" id="updatedLabel">Updated just now</div>
+        </div>
+        <div class="header__right">
+          <span class="status" id="statusBadge">Disconnected</span>
+          <button class="btn btn--ghost" id="detailsToggle" type="button">Details</button>
+        </div>
+      </header>
+
+      <main class="chat-layout">
+        <div class="chat-column">
+          <div class="chat-thread" id="chatMessages"></div>
+
+          <div class="chat-empty" id="emptyState">
+            <div class="empty-card" id="connectPanel">
+              <h2>Enter Bloom Console</h2>
+              <p>Use your existing Bloom to start chatting.</p>
+              <div class="empty-actions">
+                <button class="btn btn--primary" id="connectButton" type="button">Import existing Bloom</button>
+              </div>
+              <div class="field" id="bootstrapTokenWrap" hidden>
+                <label for="bootstrapTokenInput">Bootstrap code</label>
+                <input id="bootstrapTokenInput" placeholder="Ask the operator" autocomplete="off" />
+              </div>
+              <p class="error" id="sessionError"></p>
+            </div>
+            <div class="empty-suggestions" id="suggestions">
+              <p class="empty-label">Try asking:</p>
+              <div class="suggestion-list">
+                <button class="suggestion" data-suggestion="How much do I have?" type="button">How much do I have?</button>
+                <button class="suggestion" data-suggestion="Set aside $200 for rent Friday." type="button">Set aside $200 for rent Friday.</button>
+                <button class="suggestion" data-suggestion="Can I spend $50 today?" type="button">Can I spend $50 today?</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+      <div class="composer-bar">
+        <form class="composer" id="chatForm">
+          <textarea id="chatInput" rows="1" placeholder="Message Bloom" autocomplete="off"></textarea>
+          <div class="composer__actions">
+            <button class="btn btn--ghost" id="stopButton" type="button" hidden>Stop</button>
+            <button class="btn btn--primary" id="sendButton" type="submit">Send</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div class="overlay" id="detailsOverlay" hidden></div>
+    <aside class="details" id="detailsDrawer" aria-hidden="true">
+      <div class="details__header">
+        <h2>Details</h2>
+        <button class="btn btn--ghost" id="detailsClose" type="button">Close</button>
+      </div>
+
+      <section class="details__section">
+        <h3>Wallet</h3>
+        <div class="wallet-row">
+          <input id="walletAddress" readonly value="" />
+          <button class="btn btn--ghost" id="copyAddress" type="button">Copy</button>
+        </div>
+        <p class="helper">Send USDC to this address.</p>
+      </section>
+
+      <section class="details__section">
+        <h3>Record</h3>
+        <div class="record" id="recordList"></div>
+      </section>
+
+      <section class="details__section">
+        <h3>Lock</h3>
+        <button class="btn btn--danger" id="lockButton" type="button">Lock</button>
+        <p class="helper">Stops spending immediately.</p>
+      </section>
+
+      <section class="details__section details__section--advanced">
+        <h3>Advanced</h3>
+        <div class="advanced-block">
+          <p>Bootstrap code</p>
+          <input id="bootstrapTokenInputDetails" placeholder="Ask the operator" autocomplete="off" />
+        </div>
+        <div class="advanced-block">
+          <p>Create new Bloom (advanced)</p>
+          <input id="createConfirmInput" placeholder="Type CREATE to confirm" autocomplete="off" />
+          <button class="btn btn--primary" id="createButton" type="button">Create new Bloom (advanced)</button>
+        </div>
+        <div class="advanced-block">
+          <p>Use API key</p>
+          <input id="apiKeyInput" placeholder="bloom_sk_..." autocomplete="off" />
+          <input id="agentIdInput" placeholder="agent_..." autocomplete="off" />
+          <button class="btn btn--ghost" id="importButton" type="button">Use API key</button>
+        </div>
+        <p class="error" id="advancedError"></p>
+      </section>
+    </aside>
+
+    <script src="/console/app.js"></script>
+  </body>
+</html>
