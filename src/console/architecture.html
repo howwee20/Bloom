@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Bloom Architecture</title>
+    <link rel="stylesheet" href="/console/architecture.css" />
+  </head>
+  <body>
+    <section class="architecture">
+      <div class="arch-shell">
+        <p class="arch-label">ARCHITECTURE</p>
+        <h1 class="arch-title">Bloom Architecture</h1>
+        <p class="arch-description" id="archDescription"></p>
+
+        <div class="diagram" id="diagram">
+          <div class="diagram-inner" id="diagramInner">
+            <svg class="diagram-lines" id="diagramLines" aria-hidden="true"></svg>
+
+            <div class="diagram-stage" id="diagramStage">
+              <div class="layer interfaces" data-layer="interfaces">
+                <div class="layer-label">INTERFACES</div>
+                <div class="layer-row">
+                  <div class="pill" data-node="interface">Claude</div>
+                  <div class="pill" data-node="interface">Apps</div>
+                  <div class="pill" data-node="interface">Cards</div>
+                  <div class="pill" data-node="interface">Agents</div>
+                </div>
+              </div>
+
+              <div class="layer actions" data-layer="actions">
+                <div class="layer-label">ACTIONS</div>
+                <div class="layer-row">
+                  <div class="pill" data-node="action">Transfers</div>
+                  <div class="pill" data-node="action">Polymarket</div>
+                </div>
+              </div>
+
+              <div class="layer spend" data-layer="spend">
+                <div class="spend-badge">SPEND POWER</div>
+              </div>
+
+              <div class="layer kernel" data-layer="kernel">
+                <div class="kernel-box">
+                  <div class="kernel-title">BLOOM KERNEL</div>
+                  <div class="kernel-sub">Policy · Ledger · Receipts</div>
+                </div>
+              </div>
+
+              <div class="layer adapters" data-layer="adapters">
+                <div class="layer-label">ASSET ADAPTERS</div>
+                <div class="layer-row">
+                  <div class="pill" data-node="adapter">USDC World</div>
+                  <div class="pill" data-node="adapter">BTC World</div>
+                </div>
+              </div>
+
+              <div class="layer blockchains" data-layer="blockchains">
+                <div class="layer-label">BLOCKCHAINS</div>
+                <div class="layer-row">
+                  <div class="pill" data-node="blockchain">Base USDC</div>
+                  <div class="pill" data-node="blockchain">Bitcoin</div>
+                </div>
+              </div>
+
+              <div class="foundation" data-layer="foundation">
+                <div class="foundation-label">FOUNDATION</div>
+                <div class="foundation-body">Stewards protocol</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="stepper">
+          <button class="stepper-btn" id="prevStep" type="button" aria-label="Previous step">&larr;</button>
+          <span class="stepper-label" id="stepLabel"></span>
+          <button class="stepper-btn" id="nextStep" type="button" aria-label="Next step">&rarr;</button>
+        </div>
+      </div>
+    </section>
+
+    <script src="/console/architecture.js"></script>
+  </body>
+</html>

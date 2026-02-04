@@ -1,0 +1,337 @@
+@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap");
+
+:root {
+  color-scheme: dark;
+  --page-bg: #0b1120;
+  --ink: #f8fafc;
+  --muted: rgba(226, 232, 240, 0.72);
+  --muted-soft: rgba(226, 232, 240, 0.5);
+  --accent: #e8a87c;
+  --accent-strong: #f5c9a8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-family: "Space Grotesk", "Inter", system-ui, sans-serif;
+  background:
+    radial-gradient(600px 420px at 15% -10%, rgba(232, 168, 124, 0.25), transparent 60%),
+    radial-gradient(500px 360px at 85% 10%, rgba(94, 234, 212, 0.08), transparent 60%),
+    var(--page-bg);
+  color: var(--ink);
+}
+
+.architecture {
+  padding: 72px 0 84px;
+}
+
+.arch-shell {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 32px;
+}
+
+.arch-label {
+  margin: 0 0 10px;
+  font-size: 11px;
+  letter-spacing: 0.35em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.8);
+}
+
+.arch-title {
+  margin: 0 0 12px;
+  font-size: 34px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.arch-description {
+  margin: 0 0 28px;
+  max-width: 680px;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+.diagram {
+  position: relative;
+  min-height: 700px;
+  padding: 48px;
+  border-radius: 24px;
+  background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  box-shadow: 0 30px 80px rgba(15, 23, 42, 0.45);
+  overflow: hidden;
+}
+
+.diagram::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(500px 320px at 50% 40%, rgba(232, 168, 124, 0.1), transparent 70%),
+    radial-gradient(600px 400px at 30% 80%, rgba(94, 234, 212, 0.08), transparent 70%);
+  opacity: 0.8;
+  pointer-events: none;
+}
+
+.diagram-inner {
+  position: relative;
+  height: 100%;
+  z-index: 1;
+}
+
+.diagram-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  pointer-events: none;
+}
+
+.diagram-stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  z-index: 1;
+}
+
+.layer {
+  position: absolute;
+  left: 50%;
+  transform: translate(-50%, -10px);
+  opacity: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  transition: opacity 0.6s ease, transform 0.6s ease;
+  pointer-events: none;
+}
+
+.layer[data-visible="true"] {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  pointer-events: auto;
+}
+
+.layer-row {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.layer-label {
+  color: rgba(255, 255, 255, 0.5);
+  font-size: 10px;
+  letter-spacing: 0.15em;
+  text-transform: uppercase;
+}
+
+.pill {
+  background: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  color: #ffffff;
+  padding: 8px 16px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 500;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+.spend-badge {
+  background: linear-gradient(135deg, #f5c9a8 0%, #e8a87c 100%);
+  border: none;
+  border-radius: 20px;
+  padding: 10px 24px;
+  color: #1a1a1a;
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.05em;
+}
+
+.kernel-box {
+  background: linear-gradient(135deg, #e8a87c 0%, #d4956a 100%);
+  border: 2px solid #f5c9a8;
+  border-radius: 16px;
+  padding: 32px 48px;
+  color: #1a1a1a;
+  text-align: center;
+  box-shadow: 0 0 60px rgba(232, 168, 124, 0.3);
+  animation: kernelGlow 3s ease-in-out infinite;
+}
+
+.kernel-title {
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+}
+
+.kernel-sub {
+  margin-top: 10px;
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+}
+
+.foundation {
+  position: absolute;
+  right: 0;
+  transform: translate(24px, -50%);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  border-radius: 12px;
+  padding: 22px 24px;
+  color: rgba(255, 255, 255, 0.8);
+  text-align: left;
+  width: 180px;
+  opacity: 0;
+  transition: opacity 0.6s ease, transform 0.6s ease;
+  pointer-events: none;
+}
+
+.foundation[data-visible="true"] {
+  opacity: 1;
+  transform: translate(0, -50%);
+  pointer-events: auto;
+}
+
+.foundation-label {
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  margin-bottom: 10px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.foundation-body {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+@keyframes kernelGlow {
+  0%,
+  100% {
+    box-shadow: 0 0 60px rgba(232, 168, 124, 0.3);
+  }
+  50% {
+    box-shadow: 0 0 80px rgba(232, 168, 124, 0.5);
+  }
+}
+
+.flow-down {
+  animation: flowDown 2s linear infinite;
+}
+
+.flow-up {
+  animation: flowUp 2s linear infinite;
+}
+
+@keyframes flowDown {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: -24;
+  }
+}
+
+@keyframes flowUp {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: 24;
+  }
+}
+
+.stepper {
+  margin-top: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+}
+
+.stepper-btn {
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(15, 23, 42, 0.8);
+  color: #ffffff;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  font-size: 16px;
+  cursor: pointer;
+  transition: transform 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+}
+
+.stepper-btn:hover {
+  transform: translateY(-1px);
+  border-color: rgba(232, 168, 124, 0.6);
+}
+
+.stepper-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+}
+
+.stepper-label {
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.7);
+}
+
+@media (max-width: 900px) {
+  .arch-shell {
+    padding: 0 24px;
+  }
+
+  .diagram {
+    padding: 32px;
+    min-height: 640px;
+  }
+
+  .kernel-box {
+    padding: 26px 34px;
+  }
+
+  .foundation {
+    width: 160px;
+  }
+}
+
+@media (max-width: 640px) {
+  .architecture {
+    padding: 56px 0 72px;
+  }
+
+  .arch-title {
+    font-size: 28px;
+  }
+
+  .diagram {
+    padding: 24px;
+    min-height: 600px;
+  }
+
+  .layer-row {
+    gap: 10px;
+  }
+
+  .kernel-box {
+    padding: 22px 28px;
+  }
+
+  .foundation {
+    width: 150px;
+    transform: translate(12px, -50%);
+  }
+}
