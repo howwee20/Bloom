@@ -89,6 +89,7 @@ function renderMessages() {
 
 function renderPendingQuotes() {
   elements.pendingQuotes.innerHTML = "";
+  if (!state.session?.agent_id) return;
   if (!state.pendingQuotes.length) {
     const empty = document.createElement("p");
     empty.className = "hint";
@@ -421,8 +422,9 @@ async function executeQuote(quoteId, idempotencyKey, stepUpToken) {
 }
 
 function openStepUpModal(code) {
-  elements.stepUpCode.textContent = code || "N/A";
-  elements.stepUpStatus.textContent = "";
+  if (!state.session?.agent_id) return;
+  elements.stepUpCode.textContent = code || "—";
+  elements.stepUpStatus.textContent = code ? "" : "No active step-up challenge.";
   elements.stepUpModal.hidden = false;
 }
 
@@ -529,6 +531,7 @@ function disconnect() {
   state.session = null;
   state.messages = [];
   state.pendingQuotes = [];
+  closeStepUpModal();
   renderMessages();
   renderPendingQuotes();
 }
@@ -572,6 +575,10 @@ function seedWelcome() {
 }
 
 function init() {
+  setStatus(false);
+  elements.consoleMain.hidden = true;
+  elements.sessionPanel.hidden = false;
+  closeStepUpModal();
   elements.loginButton.addEventListener("click", login);
   elements.logoutButton.addEventListener("click", logout);
   elements.chatForm.addEventListener("submit", handleChatSubmit);
