@@ -4,6 +4,7 @@ import path from "node:path";
 export type Config = {
   API_VERSION: string;
   DB_PATH: string;
+  CONSOLE_DB_PATH: string;
   PORT: number;
   APPROVAL_UI_PORT: number;
   BIND_APPROVAL_UI: boolean;
@@ -34,6 +35,7 @@ export type Config = {
 
 const FUNDED_DB_PATH = "/Users/ejhowe/Bloom-clean/data/kernel.db";
 const LOCAL_DB_PATH = path.resolve("./data/kernel.db");
+const DEFAULT_CONSOLE_DB_PATH = path.resolve("./data/console.db");
 
 function isMemoryDbPath(dbPath: string) {
   return dbPath === ":memory:" || dbPath === "file::memory:" || dbPath.includes("mode=memory");
@@ -61,7 +63,7 @@ export function getConfig(): Config {
   const allowNewKernel =
     env.CREATE_NEW_KERNEL === "true" || env.ALLOW_NEW_KERNEL === "true" || runningInDocker;
 
-  let dbPath = env.DB_PATH;
+  let dbPath = env.KERNEL_DB_PATH ?? env.DB_PATH;
   if (!dbPath) {
     if (runningInDocker) {
       dbPath = "/data/kernel.db";
@@ -79,9 +81,21 @@ export function getConfig(): Config {
   if (!allowNewKernel && !isMemoryDbPath(dbPath) && !isFileUrlPath(dbPath) && !fs.existsSync(dbPath)) {
     throw new Error(`Funded kernel DB not found at ${dbPath}; set DB_PATH or create one.`);
   }
+
+  let consoleDbPath = env.CONSOLE_DB_PATH;
+  if (!consoleDbPath) {
+    if (runningInDocker) {
+      consoleDbPath = "/data/console.db";
+    } else if (isMemoryDbPath(dbPath) || isFileUrlPath(dbPath)) {
+      consoleDbPath = dbPath;
+    } else {
+      consoleDbPath = DEFAULT_CONSOLE_DB_PATH;
+    }
+  }
   return {
     API_VERSION: env.API_VERSION ?? "0.1.0-alpha",
     DB_PATH: dbPath,
+    CONSOLE_DB_PATH: consoleDbPath,
     PORT: env.PORT ? Number(env.PORT) : 3000,
     APPROVAL_UI_PORT: env.APPROVAL_UI_PORT ? Number(env.APPROVAL_UI_PORT) : 3001,
     BIND_APPROVAL_UI: env.BIND_APPROVAL_UI === "true",

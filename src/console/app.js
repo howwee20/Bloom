@@ -622,8 +622,8 @@ async function login() {
       showError("Console password required or incorrect.");
       return;
     }
-    if (err.code === "console_state_missing") {
-      showError("No default Bloom found. Import an existing one or create a new Bloom.");
+    if (err.code === "no_agents_found") {
+      showError("No existing Bloom found. Create a new Bloom to continue.");
       elements.createPanel.hidden = false;
       return;
     }

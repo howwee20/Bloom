@@ -89,10 +89,12 @@ async function main() {
 
   const config = getConfig();
   process.env.DB_PATH = config.DB_PATH;
+  process.env.CONSOLE_DB_PATH = config.CONSOLE_DB_PATH;
   const port = Number(process.env.PORT ?? config.PORT ?? 3000);
   const envType = process.env.ENV_TYPE ?? config.ENV_TYPE ?? "simple_economy";
 
   ensureDbDir(config.DB_PATH);
+  ensureDbDir(config.CONSOLE_DB_PATH);
 
   // eslint-disable-next-line no-console
   console.log("[bloom] Running migrations...");
@@ -114,6 +116,8 @@ async function main() {
   console.log(`✅ Console ready: http://localhost:${port}/console`);
   // eslint-disable-next-line no-console
   console.log(`✅ Using DB_PATH: ${config.DB_PATH}`);
+  // eslint-disable-next-line no-console
+  console.log(`✅ Using CONSOLE_DB_PATH: ${config.CONSOLE_DB_PATH}`);
 
   try {
     const res = await fetch(`http://localhost:${port}/console/debug`);

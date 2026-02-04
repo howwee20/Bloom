@@ -368,16 +368,29 @@ export function buildServer(options: {
   config?: ReturnType<typeof getConfig>;
   db?: DbClient;
   sqlite?: Database;
+  consoleDb?: DbClient;
+  consoleSqlite?: Database;
   env?: IEnvironment;
 } = {}) {
   const config = options.config ?? getConfig();
   if (config.DB_PATH !== ":memory:" && config.DB_PATH !== "file::memory:") {
     ensureDbPath(config.DB_PATH);
   }
+  if (config.CONSOLE_DB_PATH !== ":memory:" && config.CONSOLE_DB_PATH !== "file::memory:") {
+    ensureDbPath(config.CONSOLE_DB_PATH);
+  }
   const { sqlite, db } =
     options.db && options.sqlite
       ? { sqlite: options.sqlite, db: options.db }
       : createDatabase(config.DB_PATH);
+  const consoleDbBundle =
+    options.consoleDb && options.consoleSqlite
+      ? { sqlite: options.consoleSqlite, db: options.consoleDb }
+      : config.CONSOLE_DB_PATH === config.DB_PATH
+        ? { sqlite, db }
+        : createDatabase(config.CONSOLE_DB_PATH);
+  const consoleDb = consoleDbBundle.db;
+
   const env =
     options.env ??
     (config.ENV_TYPE === "base_usdc"
@@ -424,16 +437,28 @@ export function buildServer(options: {
   }
 
   function getConsoleState() {
-    return db.select().from(consoleState).where(eq(consoleState.id, consoleStateId)).get() as
+    const state = consoleDb.select().from(consoleState).where(eq(consoleState.id, consoleStateId)).get() as
       | typeof consoleState.$inferSelect
       | undefined;
+    if (!state) return undefined;
+    const agent = db.select().from(agents).where(eq(agents.agentId, state.agentId)).get();
+    if (!agent) return undefined;
+    return state;
+  }
+
+  function selectDefaultAgent() {
+    return db
+      .select()
+      .from(agents)
+      .orderBy(desc(agents.updatedAt), desc(agents.createdAt))
+      .get() as typeof agents.$inferSelect | undefined;
   }
 
   function createConsoleSession(input: { userId: string; agentId: string }) {
     const now = nowSeconds();
     const sessionId = newId("console_session");
     const expiresAt = now + Math.max(300, config.CONSOLE_SESSION_TTL_SECONDS);
-    db.insert(consoleSessions).values({
+    consoleDb.insert(consoleSessions).values({
       sessionId,
       userId: input.userId,
       agentId: input.agentId,
@@ -450,7 +475,7 @@ export function buildServer(options: {
       reply.status(401).send({ error: "console_session_required" });
       return null;
     }
-    const session = db.select().from(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).get() as
+    const session = consoleDb.select().from(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).get() as
       | typeof consoleSessions.$inferSelect
       | undefined;
     if (!session) {
@@ -460,7 +485,7 @@ export function buildServer(options: {
     }
     const now = nowSeconds();
     if (session.expiresAt <= now) {
-      db.delete(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).run();
+      consoleDb.delete(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).run();
       clearConsoleCookie(reply);
       reply.status(401).send({ error: "console_session_expired" });
       return null;
@@ -683,7 +708,18 @@ export function buildServer(options: {
 
     let state = getConsoleState();
     if (!state) {
-      return reply.status(404).send({ error: "console_state_missing" });
+      const agentRow = selectDefaultAgent();
+      if (!agentRow) {
+        return reply.status(404).send({ error: "no_agents_found" });
+      }
+      const now = nowSeconds();
+      consoleDb.insert(consoleState).values({
+        id: consoleStateId,
+        userId: agentRow.userId,
+        agentId: agentRow.agentId,
+        createdAt: now
+      }).run();
+      state = { id: consoleStateId, userId: agentRow.userId, agentId: agentRow.agentId, createdAt: now };
     }
 
     const session = createConsoleSession({ userId: state.userId, agentId: state.agentId });
@@ -724,15 +760,11 @@ export function buildServer(options: {
 
     let state = getConsoleState();
     if (!state) {
-      const agentRow = db
-        .select()
-        .from(agents)
-        .orderBy(desc(agents.createdAt))
-        .get() as typeof agents.$inferSelect | undefined;
+      const agentRow = selectDefaultAgent();
       if (!agentRow) return reply.status(404).send({ error: "no_agents_found" });
 
       const now = nowSeconds();
-      db.insert(consoleState).values({
+      consoleDb.insert(consoleState).values({
         id: consoleStateId,
         userId: agentRow.userId,
         agentId: agentRow.agentId,
@@ -756,8 +788,8 @@ export function buildServer(options: {
 
     const created = kernel.createAgent();
     const now = nowSeconds();
-    db.delete(consoleState).where(eq(consoleState.id, consoleStateId)).run();
-    db.insert(consoleState).values({
+    consoleDb.delete(consoleState).where(eq(consoleState.id, consoleStateId)).run();
+    consoleDb.insert(consoleState).values({
       id: consoleStateId,
       userId: created.user_id,
       agentId: created.agent_id,
@@ -771,7 +803,7 @@ export function buildServer(options: {
   app.post("/console/logout", { config: { auth: "public" } }, async (request, reply) => {
     const session = requireConsoleSession(request, reply);
     if (!session) return;
-    db.delete(consoleSessions).where(eq(consoleSessions.sessionId, session.sessionId)).run();
+    consoleDb.delete(consoleSessions).where(eq(consoleSessions.sessionId, session.sessionId)).run();
     clearConsoleCookie(reply);
     return reply.send({ ok: true });
   });
@@ -795,7 +827,8 @@ export function buildServer(options: {
     }
 
     const state = getConsoleState();
-    if (!state) {
+    const agentRow = state ?? selectDefaultAgent();
+    if (!agentRow) {
       return reply.send({
         db_path: config.DB_PATH,
         agent_id: null,
@@ -804,13 +837,14 @@ export function buildServer(options: {
         available_cents: null
       });
     }
-    const kernelState = await kernel.getState(state.agentId);
+    const agentId = agentRow.agentId;
+    const kernelState = await kernel.getState(agentId);
     const spend = kernelState?.spend_power ?? {};
     const observation = kernelState?.observation as Record<string, unknown> | undefined;
     const walletAddress = typeof observation?.wallet_address === "string" ? observation.wallet_address : null;
     return reply.send({
       db_path: config.DB_PATH,
-      agent_id: state.agentId,
+      agent_id: agentId,
       wallet_address: walletAddress,
       confirmed_cents: (spend as { confirmed_balance_cents?: number }).confirmed_balance_cents ?? null,
       available_cents: (spend as { effective_spend_power_cents?: number }).effective_spend_power_cents ?? null
@@ -1723,6 +1757,8 @@ async function main() {
   const { app, config, kernel, db } = buildServer();
   // eslint-disable-next-line no-console
   console.log(`[bloom] DB_PATH=${config.DB_PATH}`);
+  // eslint-disable-next-line no-console
+  console.log(`[bloom] CONSOLE_DB_PATH=${config.CONSOLE_DB_PATH}`);
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   if (config.BIND_APPROVAL_UI) {
     const approvalApp = buildApprovalServer({ config, kernel, db });

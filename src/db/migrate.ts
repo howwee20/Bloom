@@ -23,22 +23,36 @@ function applyMigration(sqlite: import("better-sqlite3").Database, name: string,
   tx();
 }
 
-function main() {
-  const config = getConfig();
-  const { sqlite } = createDatabase(config.DB_PATH);
-  const migrationsDir = path.resolve("src/db/migrations");
-  const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
-
+function applyMigrations(dbPath: string, files: string[]) {
+  const { sqlite } = createDatabase(dbPath);
   ensureMigrationsTable(sqlite);
   const applied = getApplied(sqlite);
 
   for (const file of files) {
     if (applied.has(file)) continue;
-    const sql = fs.readFileSync(path.join(migrationsDir, file), "utf8");
+    const sql = fs.readFileSync(path.join(path.resolve("src/db/migrations"), file), "utf8");
     applyMigration(sqlite, file, sql);
   }
 
   sqlite.close();
+}
+
+function main() {
+  const config = getConfig();
+  const migrationsDir = path.resolve("src/db/migrations");
+  const files = fs.readdirSync(migrationsDir).filter((f) => f.endsWith(".sql")).sort();
+  const consoleFiles = files.filter((file) => file.includes("console"));
+  const kernelFiles = files.filter((file) => !consoleFiles.includes(file));
+
+  if (config.CONSOLE_DB_PATH === config.DB_PATH) {
+    applyMigrations(config.DB_PATH, files);
+    return;
+  }
+
+  applyMigrations(config.DB_PATH, kernelFiles);
+  if (consoleFiles.length > 0) {
+    applyMigrations(config.CONSOLE_DB_PATH, consoleFiles);
+  }
 }
 
 main();
