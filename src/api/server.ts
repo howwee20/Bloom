@@ -649,35 +649,41 @@ export function buildServer(options: {
     return reply.send(result);
   });
 
-  const handleConsoleLogin = async (request: FastifyRequest, reply: FastifyReply) => {
-    const body = (request.body ?? {}) as { password?: string; bootstrap_token?: string };
+  function requireConsoleAuth(request: FastifyRequest, reply: FastifyReply, body: { password?: string } = {}) {
     if (config.CONSOLE_PASSWORD) {
       if (body.password !== config.CONSOLE_PASSWORD) {
-        return reply.status(403).send({ error: "console_password_required" });
+        reply.status(403).send({ error: "console_password_required" });
+        return false;
       }
-    } else if (!isLoopback(request.ip)) {
-      return reply.status(403).send({ error: "console_login_locked" });
+      return true;
     }
+    if (!isLoopback(request.ip)) {
+      reply.status(403).send({ error: "console_login_locked" });
+      return false;
+    }
+    return true;
+  }
+
+  function requireBootstrapToken(
+    reply: FastifyReply,
+    body: { bootstrap_token?: string } = {},
+    errorCode = "bootstrap_token_required"
+  ) {
+    if (!config.CONSOLE_BOOTSTRAP_TOKEN) return true;
+    if (body.bootstrap_token !== config.CONSOLE_BOOTSTRAP_TOKEN) {
+      reply.status(403).send({ error: errorCode });
+      return false;
+    }
+    return true;
+  }
+
+  const handleConsoleLogin = async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = (request.body ?? {}) as { password?: string };
+    if (!requireConsoleAuth(request, reply, body)) return;
 
     let state = getConsoleState();
     if (!state) {
-      if (config.CONSOLE_BOOTSTRAP_TOKEN) {
-        if (body.bootstrap_token !== config.CONSOLE_BOOTSTRAP_TOKEN) {
-          return reply.status(403).send({ error: "bootstrap_token_required" });
-        }
-      } else if (!isLoopback(request.ip)) {
-        return reply.status(403).send({ error: "bootstrap_locked" });
-      }
-
-      const created = kernel.createAgent();
-      const now = nowSeconds();
-      db.insert(consoleState).values({
-        id: consoleStateId,
-        userId: created.user_id,
-        agentId: created.agent_id,
-        createdAt: now
-      }).run();
-      state = { id: consoleStateId, userId: created.user_id, agentId: created.agent_id, createdAt: now };
+      return reply.status(404).send({ error: "console_state_missing" });
     }
 
     const session = createConsoleSession({ userId: state.userId, agentId: state.agentId });
@@ -712,6 +718,55 @@ export function buildServer(options: {
 
   app.post("/console/login", { config: { auth: "public" } }, handleConsoleLogin);
   app.post("/console/bootstrap", { config: { auth: "public" } }, handleConsoleLogin);
+  app.post("/console/import", { config: { auth: "public" } }, async (request, reply) => {
+    const body = (request.body ?? {}) as { password?: string };
+    if (!requireConsoleAuth(request, reply, body)) return;
+
+    let state = getConsoleState();
+    if (!state) {
+      const agentRow = db
+        .select()
+        .from(agents)
+        .orderBy(desc(agents.createdAt))
+        .get() as typeof agents.$inferSelect | undefined;
+      if (!agentRow) return reply.status(404).send({ error: "no_agents_found" });
+
+      const now = nowSeconds();
+      db.insert(consoleState).values({
+        id: consoleStateId,
+        userId: agentRow.userId,
+        agentId: agentRow.agentId,
+        createdAt: now
+      }).run();
+      state = { id: consoleStateId, userId: agentRow.userId, agentId: agentRow.agentId, createdAt: now };
+    }
+
+    const session = createConsoleSession({ userId: state.userId, agentId: state.agentId });
+    setConsoleCookie(reply, session.sessionId, config.CONSOLE_SESSION_TTL_SECONDS);
+    return reply.send({ user_id: state.userId, agent_id: state.agentId, expires_at: session.expiresAt });
+  });
+
+  app.post("/console/create", { config: { auth: "public" } }, async (request, reply) => {
+    const body = (request.body ?? {}) as { password?: string; bootstrap_token?: string; confirm?: string };
+    if (!requireConsoleAuth(request, reply, body)) return;
+    if (body.confirm !== "CREATE") {
+      return reply.status(400).send({ error: "confirm_create_required" });
+    }
+    if (!requireBootstrapToken(reply, body)) return;
+
+    const created = kernel.createAgent();
+    const now = nowSeconds();
+    db.delete(consoleState).where(eq(consoleState.id, consoleStateId)).run();
+    db.insert(consoleState).values({
+      id: consoleStateId,
+      userId: created.user_id,
+      agentId: created.agent_id,
+      createdAt: now
+    }).run();
+    const session = createConsoleSession({ userId: created.user_id, agentId: created.agent_id });
+    setConsoleCookie(reply, session.sessionId, config.CONSOLE_SESSION_TTL_SECONDS);
+    return reply.send({ user_id: created.user_id, agent_id: created.agent_id, expires_at: session.expiresAt });
+  });
 
   app.post("/console/logout", { config: { auth: "public" } }, async (request, reply) => {
     const session = requireConsoleSession(request, reply);
@@ -728,6 +783,37 @@ export function buildServer(options: {
       user_id: session.userId,
       agent_id: session.agentId,
       expires_at: session.expiresAt
+    });
+  });
+
+  app.get("/console/debug", { config: { auth: "public" } }, async (request, reply) => {
+    if (process.env.NODE_ENV === "production") {
+      return reply.status(404).send({ error: "not_found" });
+    }
+    if (!isLoopback(request.ip)) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+
+    const state = getConsoleState();
+    if (!state) {
+      return reply.send({
+        db_path: config.DB_PATH,
+        agent_id: null,
+        wallet_address: null,
+        confirmed_cents: null,
+        available_cents: null
+      });
+    }
+    const kernelState = await kernel.getState(state.agentId);
+    const spend = kernelState?.spend_power ?? {};
+    const observation = kernelState?.observation as Record<string, unknown> | undefined;
+    const walletAddress = typeof observation?.wallet_address === "string" ? observation.wallet_address : null;
+    return reply.send({
+      db_path: config.DB_PATH,
+      agent_id: state.agentId,
+      wallet_address: walletAddress,
+      confirmed_cents: (spend as { confirmed_balance_cents?: number }).confirmed_balance_cents ?? null,
+      available_cents: (spend as { effective_spend_power_cents?: number }).effective_spend_power_cents ?? null
     });
   });
 
@@ -1635,6 +1721,8 @@ export function buildApprovalServer(input: {
 
 async function main() {
   const { app, config, kernel, db } = buildServer();
+  // eslint-disable-next-line no-console
+  console.log(`[bloom] DB_PATH=${config.DB_PATH}`);
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   if (config.BIND_APPROVAL_UI) {
     const approvalApp = buildApprovalServer({ config, kernel, db });

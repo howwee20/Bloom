@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 
 export type Config = {
   API_VERSION: string;
@@ -31,6 +32,17 @@ export type Config = {
   CONSOLE_SESSION_TTL_SECONDS: number;
 };
 
+const FUNDED_DB_PATH = "/Users/ejhowe/Bloom-clean/data/kernel.db";
+const LOCAL_DB_PATH = path.resolve("./data/kernel.db");
+
+function isMemoryDbPath(dbPath: string) {
+  return dbPath === ":memory:" || dbPath === "file::memory:" || dbPath.includes("mode=memory");
+}
+
+function isFileUrlPath(dbPath: string) {
+  return dbPath.startsWith("file:");
+}
+
 function isRunningInDocker() {
   if (process.env.BLOOM_DOCKER === "true" || process.env.DOCKER === "true") return true;
   if (fs.existsSync("/.dockerenv") || fs.existsSync("/.containerenv")) return true;
@@ -46,10 +58,26 @@ function isRunningInDocker() {
 export function getConfig(): Config {
   const env = process.env;
   const runningInDocker = isRunningInDocker();
-  const defaultDbPath = runningInDocker ? "/data/kernel.db" : "./data/kernel.db";
-  const dbPath = env.DB_PATH ?? defaultDbPath;
+  const allowNewKernel =
+    env.CREATE_NEW_KERNEL === "true" || env.ALLOW_NEW_KERNEL === "true" || runningInDocker;
+
+  let dbPath = env.DB_PATH;
+  if (!dbPath) {
+    if (runningInDocker) {
+      dbPath = "/data/kernel.db";
+    } else if (fs.existsSync(FUNDED_DB_PATH)) {
+      dbPath = FUNDED_DB_PATH;
+    } else if (allowNewKernel) {
+      dbPath = LOCAL_DB_PATH;
+    } else {
+      throw new Error(`Funded kernel DB not found at ${FUNDED_DB_PATH}; set DB_PATH or create one.`);
+    }
+  }
   if (dbPath === "/data/kernel.db" && !runningInDocker) {
     throw new Error("DB_PATH=/data/kernel.db is reserved for Docker. Use ./data/kernel.db or set BLOOM_DOCKER=true.");
+  }
+  if (!allowNewKernel && !isMemoryDbPath(dbPath) && !isFileUrlPath(dbPath) && !fs.existsSync(dbPath)) {
+    throw new Error(`Funded kernel DB not found at ${dbPath}; set DB_PATH or create one.`);
   }
   return {
     API_VERSION: env.API_VERSION ?? "0.1.0-alpha",

@@ -6,44 +6,51 @@ const state = {
   refreshTimer: null,
   refreshInFlight: false,
   isStreaming: false,
-  streamAbort: null
+  streamAbort: null,
+  lastUpdatedAt: null,
+  consolePassword: ""
 };
 
 const elements = {
   statusBadge: document.getElementById("statusBadge"),
+  detailsButton: document.getElementById("detailsButton"),
+  detailsDrawer: document.getElementById("detailsDrawer"),
+  closeDetails: document.getElementById("closeDetails"),
+  drawerBackdrop: document.getElementById("drawerBackdrop"),
   sessionPanel: document.getElementById("sessionPanel"),
   consoleMain: document.getElementById("consoleMain"),
   passwordInput: document.getElementById("passwordInput"),
   bootstrapTokenWrap: document.getElementById("bootstrapTokenWrap"),
   bootstrapTokenInput: document.getElementById("bootstrapTokenInput"),
   loginButton: document.getElementById("loginButton"),
-  logoutButton: document.getElementById("logoutButton"),
+  importButton: document.getElementById("importButton"),
+  createPanel: document.getElementById("createPanel"),
+  createConfirmInputLogin: document.getElementById("createConfirmInputLogin"),
+  createButtonLogin: document.getElementById("createButtonLogin"),
   sessionError: document.getElementById("sessionError"),
+  sessionHint: document.getElementById("sessionHint"),
+  availableValue: document.getElementById("availableValue"),
+  availableUpdated: document.getElementById("availableUpdated"),
   chatForm: document.getElementById("chatForm"),
   chatInput: document.getElementById("chatInput"),
   chatMessages: document.getElementById("chatMessages"),
-  pendingQuotes: document.getElementById("pendingQuotes"),
-  availableValue: document.getElementById("availableValue"),
-  confirmedValue: document.getElementById("confirmedValue"),
-  reservedValue: document.getElementById("reservedValue"),
+  chatSuggestions: document.getElementById("chatSuggestions"),
+  stopButton: document.getElementById("stopButton"),
+  sendButton: document.getElementById("sendButton"),
   walletAddress: document.getElementById("walletAddress"),
   copyAddress: document.getElementById("copyAddress"),
   fundingHint: document.getElementById("fundingHint"),
-  receiptsList: document.getElementById("receiptsList"),
-  accountMeta: document.getElementById("accountMeta"),
-  stopButton: document.getElementById("stopButton"),
-  sendButton: document.getElementById("sendButton"),
-  freezeButton: document.getElementById("freezeButton"),
-  stepUpModal: document.getElementById("stepUpModal"),
-  stepUpCode: document.getElementById("stepUpCode"),
-  stepUpApprove: document.getElementById("stepUpApprove"),
-  stepUpCancel: document.getElementById("stepUpCancel"),
-  stepUpStatus: document.getElementById("stepUpStatus")
+  recordList: document.getElementById("recordList"),
+  lockButton: document.getElementById("lockButton"),
+  createConfirmInput: document.getElementById("createConfirmInput"),
+  createButton: document.getElementById("createButton"),
+  createError: document.getElementById("createError")
 };
 
 function setStatus(connected) {
   elements.statusBadge.textContent = connected ? "Connected" : "Disconnected";
   elements.statusBadge.classList.toggle("status--ok", connected);
+  elements.detailsButton.disabled = !connected;
 }
 
 function formatMoney(cents) {
@@ -58,6 +65,18 @@ function formatExpires(timestamp) {
   return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
 }
 
+function formatUpdated(seconds) {
+  if (!seconds) return "Updated just now";
+  const now = Math.floor(Date.now() / 1000);
+  const diff = Math.max(0, now - seconds);
+  if (diff < 5) return "Updated just now";
+  if (diff < 60) return `Updated ${diff}s ago`;
+  const mins = Math.floor(diff / 60);
+  if (mins < 60) return `Updated ${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  return `Updated ${hours}h ago`;
+}
+
 function showError(message) {
   elements.sessionError.textContent = message;
 }
@@ -68,6 +87,7 @@ function clearError() {
 
 function setStreaming(active) {
   state.isStreaming = active;
+  elements.stopButton.hidden = !active;
   elements.stopButton.disabled = !active;
   elements.chatInput.disabled = active;
   elements.sendButton.disabled = active;
@@ -76,89 +96,170 @@ function setStreaming(active) {
   }
 }
 
-function renderMessages() {
+function renderSuggestions() {
+  const show =
+    state.messages.length === 0 &&
+    !state.isStreaming &&
+    state.pendingQuotes.length === 0 &&
+    !state.stepUp &&
+    !!state.session?.agent_id;
+  elements.chatSuggestions.hidden = !show;
+}
+
+function buildMessageRow(message) {
+  const row = document.createElement("div");
+  row.className = `message-row message-row--${message.role}`;
+  const bubble = document.createElement("div");
+  bubble.className = `message message--${message.role}${message.streaming ? " message--streaming" : ""}`;
+  bubble.textContent = message.content;
+  row.appendChild(bubble);
+  return row;
+}
+
+function buildQuoteCard(quote) {
+  const row = document.createElement("div");
+  row.className = "message-row message-row--assistant";
+
+  const card = document.createElement("div");
+  card.className = `action-card${quote.allowed ? "" : " action-card--declined"}`;
+
+  const title = document.createElement("h4");
+  title.textContent = quote.allowed ? "Approval needed" : "Not approved";
+  card.appendChild(title);
+
+  const summary = document.createElement("p");
+  summary.textContent = quote.summary || quote.reason || "Quote created";
+  card.appendChild(summary);
+
+  if (quote.reason && !quote.allowed) {
+    const reason = document.createElement("p");
+    reason.className = "action-card__meta";
+    reason.textContent = `Reason: ${quote.reason}`;
+    card.appendChild(reason);
+  }
+
+  if (quote.expires_at) {
+    const expires = document.createElement("p");
+    expires.className = "action-card__meta";
+    expires.textContent = `Expires ${formatExpires(quote.expires_at)}`;
+    card.appendChild(expires);
+  }
+
+  if (quote.allowed) {
+    const actionRow = document.createElement("div");
+    actionRow.className = "action-card__actions";
+
+    const approve = document.createElement("button");
+    approve.className = "btn btn--primary";
+    approve.textContent = quote.requires_step_up ? "Approve (step-up)" : "Approve";
+    approve.addEventListener("click", () => handleApproval(quote));
+
+    const cancel = document.createElement("button");
+    cancel.className = "btn btn--ghost";
+    cancel.textContent = "Cancel";
+    cancel.addEventListener("click", () => dismissQuote(quote.quote_id));
+
+    actionRow.appendChild(approve);
+    actionRow.appendChild(cancel);
+    card.appendChild(actionRow);
+  }
+
+  row.appendChild(card);
+  return row;
+}
+
+function buildStepUpCard(stepUp) {
+  const row = document.createElement("div");
+  row.className = "message-row message-row--assistant";
+
+  const card = document.createElement("div");
+  card.className = "action-card";
+
+  const title = document.createElement("h4");
+  title.textContent = "Enter code to approve";
+  card.appendChild(title);
+
+  if (stepUp.summary) {
+    const summary = document.createElement("p");
+    summary.textContent = stepUp.summary;
+    card.appendChild(summary);
+  }
+
+  const inputRow = document.createElement("div");
+  inputRow.className = "step-up-input";
+
+  const input = document.createElement("input");
+  input.placeholder = "Enter code";
+  input.autocomplete = "off";
+  if (stepUp.code) {
+    input.value = stepUp.code;
+  }
+
+  const confirm = document.createElement("button");
+  confirm.className = "btn btn--primary";
+  confirm.textContent = "Confirm";
+  confirm.addEventListener("click", () => confirmStepUp(input.value));
+
+  const cancel = document.createElement("button");
+  cancel.className = "btn btn--ghost";
+  cancel.textContent = "Cancel";
+  cancel.addEventListener("click", () => cancelStepUp());
+
+  inputRow.appendChild(input);
+  inputRow.appendChild(confirm);
+  inputRow.appendChild(cancel);
+  card.appendChild(inputRow);
+
+  if (stepUp.error) {
+    const error = document.createElement("p");
+    error.className = "error";
+    error.textContent = stepUp.error;
+    card.appendChild(error);
+  }
+
+  row.appendChild(card);
+  return row;
+}
+
+function renderThread() {
   elements.chatMessages.innerHTML = "";
   state.messages.forEach((msg) => {
-    const div = document.createElement("div");
-    div.className = `message message--${msg.role}${msg.streaming ? " message--streaming" : ""}`;
-    div.textContent = msg.content;
-    elements.chatMessages.appendChild(div);
+    elements.chatMessages.appendChild(buildMessageRow(msg));
   });
+
+  if (state.session?.agent_id) {
+    state.pendingQuotes.forEach((quote) => {
+      elements.chatMessages.appendChild(buildQuoteCard(quote));
+    });
+
+    if (state.stepUp) {
+      elements.chatMessages.appendChild(buildStepUpCard(state.stepUp));
+    }
+  }
+
+  renderSuggestions();
   elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
 }
 
-function renderPendingQuotes() {
-  elements.pendingQuotes.innerHTML = "";
-  if (!state.session?.agent_id) return;
-  if (!state.pendingQuotes.length) {
-    const empty = document.createElement("p");
-    empty.className = "hint";
-    empty.textContent = "No approvals waiting.";
-    elements.pendingQuotes.appendChild(empty);
-    return;
-  }
-
-  state.pendingQuotes.forEach((quote) => {
-    const card = document.createElement("div");
-    card.className = `pending-card${quote.allowed ? "" : " pending-card--declined"}`;
-
-    const title = document.createElement("h4");
-    title.textContent = quote.allowed ? "Approval required" : "Declined";
-
-    const summary = document.createElement("p");
-    summary.textContent = quote.summary || quote.reason || "Quote created";
-
-    card.appendChild(title);
-    card.appendChild(summary);
-
-    if (quote.reason && !quote.allowed) {
-      const reason = document.createElement("p");
-      reason.className = "pending-meta";
-      reason.textContent = `Reason: ${quote.reason}`;
-      card.appendChild(reason);
-    }
-
-    if (quote.expires_at) {
-      const expires = document.createElement("p");
-      expires.className = "pending-meta";
-      expires.textContent = `Expires ${formatExpires(quote.expires_at)}`;
-      card.appendChild(expires);
-    }
-
-    if (quote.allowed) {
-      const actionRow = document.createElement("div");
-      actionRow.className = "pending-actions";
-      const btn = document.createElement("button");
-      btn.className = "btn btn--primary";
-      btn.textContent = quote.requires_step_up ? "Approve (Step-Up)" : "Approve";
-      btn.addEventListener("click", () => handleApproval(quote));
-      actionRow.appendChild(btn);
-      card.appendChild(actionRow);
-    }
-
-    elements.pendingQuotes.appendChild(card);
-  });
-}
-
-function renderReceipts(activity) {
-  elements.receiptsList.innerHTML = "";
+function renderRecord(activity) {
+  elements.recordList.innerHTML = "";
   if (!activity || activity.length === 0) {
     const empty = document.createElement("p");
     empty.className = "hint";
-    empty.textContent = "No receipts yet.";
-    elements.receiptsList.appendChild(empty);
+    empty.textContent = "No record yet.";
+    elements.recordList.appendChild(empty);
     return;
   }
 
   activity.forEach((item) => {
     const row = document.createElement("div");
-    row.className = "receipt__item";
+    row.className = "record-item";
 
     const headline = document.createElement("strong");
     headline.textContent = item.line;
 
     const meta = document.createElement("div");
-    meta.className = "receipt__meta";
+    meta.className = "record-meta";
     meta.textContent = item.when;
 
     row.appendChild(headline);
@@ -166,12 +267,12 @@ function renderReceipts(activity) {
 
     if (item.summary && item.summary.length) {
       const summary = document.createElement("div");
-      summary.className = "receipt__meta";
+      summary.className = "record-meta";
       summary.textContent = item.summary.join(" · ");
       row.appendChild(summary);
     }
 
-    elements.receiptsList.appendChild(row);
+    elements.recordList.appendChild(row);
   });
 }
 
@@ -211,27 +312,19 @@ async function refreshOverview() {
   try {
     const overview = await consoleFetch("/console/overview", { method: "GET" });
     const spend = overview?.state?.spend_power || {};
-    const reserved = (spend.reserved_outgoing_cents || 0) + (spend.reserved_holds_cents || 0);
 
     elements.availableValue.textContent = formatMoney(spend.effective_spend_power_cents);
-    elements.confirmedValue.textContent = formatMoney(spend.confirmed_balance_cents);
-    elements.reservedValue.textContent = formatMoney(reserved);
+    state.lastUpdatedAt = overview?.updated_at ?? null;
+    elements.availableUpdated.textContent = formatUpdated(state.lastUpdatedAt);
 
     const walletAddress = overview?.state?.observation?.wallet_address;
-    elements.walletAddress.value = walletAddress || "Not available";
+    elements.walletAddress.textContent = walletAddress || "Not available";
     elements.copyAddress.disabled = !walletAddress;
     elements.fundingHint.textContent = walletAddress
-      ? "Add funds by sending USDC to this address."
+      ? "Send USDC to this address."
       : "This environment does not expose a wallet address.";
 
-    if (state.session?.agent_id) {
-      const expires = state.session.expires_at
-        ? ` · session expires ${formatExpires(state.session.expires_at)}`
-        : "";
-      elements.accountMeta.textContent = `agent_id=${state.session.agent_id}${expires}`;
-    }
-
-    renderReceipts(overview?.activity || []);
+    renderRecord(overview?.activity || []);
   } catch (err) {
     if (err.status === 401) {
       disconnect();
@@ -246,6 +339,10 @@ async function refreshOverview() {
 function scheduleRefresh() {
   if (state.refreshTimer) window.clearInterval(state.refreshTimer);
   state.refreshTimer = window.setInterval(refreshOverview, 2000);
+}
+
+function getChatHistory() {
+  return state.messages.map((msg) => ({ role: msg.role, content: msg.content }));
 }
 
 async function streamChat(messages) {
@@ -280,7 +377,7 @@ async function streamChat(messages) {
   }
 
   const streamingIndex = state.messages.push({ role: "assistant", content: "", streaming: true }) - 1;
-  renderMessages();
+  renderThread();
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -290,7 +387,7 @@ async function streamChat(messages) {
     const msg = state.messages[streamingIndex];
     if (!msg) return;
     msg.content += token;
-    renderMessages();
+    renderThread();
   };
 
   const finalize = (text, pendingQuotes) => {
@@ -303,8 +400,7 @@ async function streamChat(messages) {
       ...quote,
       summary: quote.summary || quote.reason || "Quote created"
     }));
-    renderMessages();
-    renderPendingQuotes();
+    renderThread();
     refreshOverview();
   };
 
@@ -354,7 +450,7 @@ async function streamChat(messages) {
   if (msg) {
     msg.streaming = false;
   }
-  renderMessages();
+  renderThread();
   setStreaming(false);
 }
 
@@ -366,10 +462,11 @@ async function handleChatSubmit(event) {
 
   state.messages.push({ role: "user", content: text });
   elements.chatInput.value = "";
-  renderMessages();
+  resizeTextarea();
+  renderThread();
 
   try {
-    await streamChat(state.messages);
+    await streamChat(getChatHistory());
   } catch (err) {
     const streamingIndex = state.messages.findIndex((msg) => msg.streaming);
     if (streamingIndex >= 0) {
@@ -380,13 +477,18 @@ async function handleChatSubmit(event) {
     }
     if (err.name === "AbortError") {
       setStreaming(false);
-      renderMessages();
+      renderThread();
       return;
     }
     state.messages.push({ role: "assistant", content: `Error: ${err.message}` });
-    renderMessages();
+    renderThread();
     setStreaming(false);
   }
+}
+
+function dismissQuote(quoteId) {
+  state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quoteId);
+  renderThread();
 }
 
 async function handleApproval(quote) {
@@ -395,10 +497,16 @@ async function handleApproval(quote) {
     if (quote.requires_step_up) {
       const stepUp = await consoleFetch("/console/step_up/request", {
         method: "POST",
-        body: JSON.stringify({ agent_id: state.session.agent_id, quote_id: quote.quote_id })
+        body: JSON.stringify({ quote_id: quote.quote_id })
       });
-      state.stepUp = { ...stepUp, quote_id: quote.quote_id, idempotency_key: quote.idempotency_key };
-      openStepUpModal(stepUp.code);
+      state.stepUp = {
+        ...stepUp,
+        quote_id: quote.quote_id,
+        idempotency_key: quote.idempotency_key,
+        summary: quote.summary || "Approval required",
+        error: null
+      };
+      renderThread();
       return;
     }
     await executeQuote(quote.quote_id, quote.idempotency_key);
@@ -417,54 +525,68 @@ async function executeQuote(quoteId, idempotencyKey, stepUpToken) {
     })
   });
   state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quoteId);
-  renderPendingQuotes();
+  state.stepUp = null;
+  renderThread();
   refreshOverview();
 }
 
-function openStepUpModal(code) {
-  if (!state.session?.agent_id) return;
-  elements.stepUpCode.textContent = code || "—";
-  elements.stepUpStatus.textContent = code ? "" : "No active step-up challenge.";
-  elements.stepUpModal.hidden = false;
-}
-
-function closeStepUpModal() {
-  elements.stepUpModal.hidden = true;
-  elements.stepUpStatus.textContent = "";
-  state.stepUp = null;
-}
-
-async function confirmStepUp() {
+async function confirmStepUp(code) {
   if (!state.stepUp) return;
-  elements.stepUpStatus.textContent = "Approving...";
+  const trimmed = String(code || "").trim();
+  if (!trimmed) {
+    state.stepUp.error = "Enter the code to approve.";
+    renderThread();
+    return;
+  }
   try {
     const result = await consoleFetch("/console/step_up/confirm", {
       method: "POST",
       body: JSON.stringify({
         challenge_id: state.stepUp.challenge_id,
-        code: state.stepUp.code,
+        code: trimmed,
         decision: "approve"
       })
     });
     const token = result?.step_up_token;
     if (!token) throw new Error("No step-up token returned.");
     await executeQuote(state.stepUp.quote_id, state.stepUp.idempotency_key, token);
-    closeStepUpModal();
   } catch (err) {
-    elements.stepUpStatus.textContent = `Failed: ${err.message}`;
+    state.stepUp.error = `Failed: ${err.message}`;
+    renderThread();
   }
 }
 
-async function freezeAgent() {
+async function cancelStepUp() {
+  if (!state.stepUp) return;
+  try {
+    if (state.stepUp.code) {
+      await consoleFetch("/console/step_up/confirm", {
+        method: "POST",
+        body: JSON.stringify({
+          challenge_id: state.stepUp.challenge_id,
+          code: state.stepUp.code,
+          decision: "deny"
+        })
+      });
+    }
+  } catch (err) {
+    console.error(err);
+  } finally {
+    state.stepUp = null;
+    renderThread();
+  }
+}
+
+async function lockAccount() {
   if (!state.session?.agent_id) return;
-  const confirmFreeze = window.confirm("Freeze this account? This stops new actions until unfrozen.");
-  if (!confirmFreeze) return;
+  const confirmLock = window.confirm("Lock this account? This stops new actions immediately.");
+  if (!confirmLock) return;
   try {
     await consoleFetch("/console/freeze", {
       method: "POST",
-      body: JSON.stringify({ reason: "console_freeze" })
+      body: JSON.stringify({ reason: "console_lock" })
     });
-    alert("Account frozen. You can unfreeze by updating policy on the backend.");
+    alert("Account locked. You can unlock it by updating policies on the backend.");
   } catch (err) {
     alert(err.message);
   }
@@ -473,6 +595,7 @@ async function freezeAgent() {
 async function login() {
   clearError();
   const password = elements.passwordInput.value.trim();
+  state.consolePassword = password;
   const bootstrapToken = elements.bootstrapTokenInput.value.trim();
   try {
     const session = await consoleFetch("/console/login", {
@@ -486,12 +609,82 @@ async function login() {
     elements.bootstrapTokenWrap.hidden = true;
     elements.bootstrapTokenInput.value = "";
     elements.passwordInput.value = "";
+    elements.createPanel.hidden = true;
     setSession(session);
     onConnected();
   } catch (err) {
     if (err.code === "bootstrap_token_required") {
       elements.bootstrapTokenWrap.hidden = false;
-      showError("Enter the bootstrap code to create a Bloom account.");
+      showError("Enter the bootstrap code to continue.");
+      return;
+    }
+    if (err.code === "console_password_required") {
+      showError("Console password required or incorrect.");
+      return;
+    }
+    if (err.code === "console_state_missing") {
+      showError("No default Bloom found. Import an existing one or create a new Bloom.");
+      elements.createPanel.hidden = false;
+      return;
+    }
+    showError(err.message);
+  }
+}
+
+async function importExisting() {
+  clearError();
+  const password = elements.passwordInput.value.trim();
+  state.consolePassword = password;
+  try {
+    const session = await consoleFetch("/console/import", {
+      method: "POST",
+      body: JSON.stringify({
+        password: password || undefined
+      })
+    });
+    elements.passwordInput.value = "";
+    elements.createPanel.hidden = true;
+    setSession(session);
+    onConnected();
+  } catch (err) {
+    if (err.code === "console_password_required") {
+      showError("Console password required or incorrect.");
+      return;
+    }
+    if (err.code === "no_agents_found") {
+      showError("No existing Bloom found in this kernel. Create a new Bloom to continue.");
+      elements.createPanel.hidden = false;
+      return;
+    }
+    showError(err.message);
+  }
+}
+
+async function createNewBloom(confirmInput) {
+  clearError();
+  const confirmValue = String(confirmInput.value || "").trim();
+  if (confirmValue !== "CREATE") {
+    showError("Type CREATE to confirm.");
+    return;
+  }
+  try {
+    const session = await consoleFetch("/console/create", {
+      method: "POST",
+      body: JSON.stringify({
+        password: state.consolePassword || undefined,
+        bootstrap_token: elements.bootstrapTokenInput.value.trim() || undefined,
+        confirm: confirmValue
+      })
+    });
+    confirmInput.value = "";
+    elements.bootstrapTokenInput.value = "";
+    elements.createPanel.hidden = true;
+    setSession(session);
+    onConnected();
+  } catch (err) {
+    if (err.code === "bootstrap_token_required") {
+      elements.bootstrapTokenWrap.hidden = false;
+      showError("Enter the bootstrap code to continue.");
       return;
     }
     if (err.code === "console_password_required") {
@@ -499,6 +692,30 @@ async function login() {
       return;
     }
     showError(err.message);
+  }
+}
+
+async function createNewBloomFromDrawer() {
+  elements.createError.textContent = "";
+  const confirmValue = String(elements.createConfirmInput.value || "").trim();
+  if (confirmValue !== "CREATE") {
+    elements.createError.textContent = "Type CREATE to confirm.";
+    return;
+  }
+  try {
+    const session = await consoleFetch("/console/create", {
+      method: "POST",
+      body: JSON.stringify({
+        password: state.consolePassword || undefined,
+        confirm: confirmValue
+      })
+    });
+    elements.createConfirmInput.value = "";
+    setSession(session);
+    onConnected();
+    closeDetails();
+  } catch (err) {
+    elements.createError.textContent = err.message;
   }
 }
 
@@ -519,9 +736,9 @@ function onConnected() {
   setStatus(true);
   elements.consoleMain.hidden = false;
   elements.sessionPanel.hidden = true;
+  renderThread();
   refreshOverview();
   scheduleRefresh();
-  seedWelcome();
 }
 
 function disconnect() {
@@ -531,9 +748,11 @@ function disconnect() {
   state.session = null;
   state.messages = [];
   state.pendingQuotes = [];
-  closeStepUpModal();
-  renderMessages();
-  renderPendingQuotes();
+  state.stepUp = null;
+  elements.availableValue.textContent = "—";
+  elements.availableUpdated.textContent = "Updated just now";
+  renderThread();
+  closeDetails();
 }
 
 async function hydrateSession() {
@@ -557,36 +776,71 @@ function stopStreaming() {
 }
 
 function copyWallet() {
-  const value = elements.walletAddress.value;
-  if (!value || value === "Not available") return;
+  const value = elements.walletAddress.textContent;
+  if (!value || value === "Not available" || value === "—") return;
   navigator.clipboard.writeText(value).then(() => {
     elements.copyAddress.textContent = "Copied";
     setTimeout(() => (elements.copyAddress.textContent = "Copy"), 1500);
   });
 }
 
-function seedWelcome() {
-  if (state.messages.length) return;
-  state.messages.push({
-    role: "assistant",
-    content: "Ask me about your balance or propose a transfer. I'll ask for approval before anything moves."
-  });
-  renderMessages();
+function resizeTextarea() {
+  const input = elements.chatInput;
+  input.style.height = "auto";
+  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+}
+
+function handleSuggestionClick(event) {
+  const target = event.target;
+  if (!target || !target.dataset || !target.dataset.suggestion) return;
+  elements.chatInput.value = target.dataset.suggestion;
+  resizeTextarea();
+  elements.chatInput.focus();
+}
+
+function openDetails() {
+  elements.detailsDrawer.classList.add("drawer--open");
+  elements.drawerBackdrop.classList.add("drawer-backdrop--open");
+  elements.drawerBackdrop.hidden = false;
+  elements.detailsDrawer.setAttribute("aria-hidden", "false");
+}
+
+function closeDetails() {
+  elements.detailsDrawer.classList.remove("drawer--open");
+  elements.drawerBackdrop.classList.remove("drawer-backdrop--open");
+  elements.drawerBackdrop.hidden = true;
+  elements.detailsDrawer.setAttribute("aria-hidden", "true");
+}
+
+function handleComposerKeydown(event) {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    elements.chatForm.requestSubmit();
+  }
 }
 
 function init() {
   setStatus(false);
   elements.consoleMain.hidden = true;
   elements.sessionPanel.hidden = false;
-  closeStepUpModal();
+  elements.stopButton.hidden = true;
+  elements.detailsButton.disabled = true;
+  renderThread();
+
   elements.loginButton.addEventListener("click", login);
-  elements.logoutButton.addEventListener("click", logout);
+  elements.importButton.addEventListener("click", importExisting);
+  elements.createButtonLogin.addEventListener("click", () => createNewBloom(elements.createConfirmInputLogin));
   elements.chatForm.addEventListener("submit", handleChatSubmit);
+  elements.chatInput.addEventListener("input", resizeTextarea);
+  elements.chatInput.addEventListener("keydown", handleComposerKeydown);
+  elements.chatSuggestions.addEventListener("click", handleSuggestionClick);
   elements.copyAddress.addEventListener("click", copyWallet);
   elements.stopButton.addEventListener("click", stopStreaming);
-  elements.freezeButton.addEventListener("click", freezeAgent);
-  elements.stepUpCancel.addEventListener("click", closeStepUpModal);
-  elements.stepUpApprove.addEventListener("click", confirmStepUp);
+  elements.lockButton.addEventListener("click", lockAccount);
+  elements.createButton.addEventListener("click", createNewBloomFromDrawer);
+  elements.detailsButton.addEventListener("click", openDetails);
+  elements.closeDetails.addEventListener("click", closeDetails);
+  elements.drawerBackdrop.addEventListener("click", closeDetails);
 
   hydrateSession();
 }

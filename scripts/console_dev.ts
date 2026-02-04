@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { getConfig } from "../src/config.js";
 
 function loadEnvFile(filePath = path.resolve(".env")) {
   if (!fs.existsSync(filePath)) return;
@@ -32,6 +33,16 @@ function ensureNode() {
     // eslint-disable-next-line no-console
     console.error("Node 20.x is required. Current:", process.versions.node);
     process.exit(1);
+  }
+}
+
+function ensureDbDir(dbPath: string) {
+  if (!dbPath) return;
+  if (dbPath === ":memory:" || dbPath === "file::memory:" || dbPath.includes("mode=memory")) return;
+  if (dbPath.startsWith("file:")) return;
+  const dir = path.dirname(dbPath);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
@@ -76,8 +87,12 @@ async function main() {
   loadEnvFile();
   ensureNode();
 
-  const port = Number(process.env.PORT ?? 3000);
-  const envType = process.env.ENV_TYPE ?? "simple_economy";
+  const config = getConfig();
+  process.env.DB_PATH = config.DB_PATH;
+  const port = Number(process.env.PORT ?? config.PORT ?? 3000);
+  const envType = process.env.ENV_TYPE ?? config.ENV_TYPE ?? "simple_economy";
+
+  ensureDbDir(config.DB_PATH);
 
   if (!process.env.ANTHROPIC_API_KEY) {
     // eslint-disable-next-line no-console
@@ -95,13 +110,15 @@ async function main() {
   let worker: ReturnType<typeof spawnProcess> | null = null;
   if (envType === "base_usdc") {
     // eslint-disable-next-line no-console
-    console.log("[bloom] Starting Base USDC worker...");
+    console.log("[bloom] Starting Base USDC observer (reconcile)...");
     worker = spawnProcess("pnpm", ["worker:base_usdc"]);
   }
 
   await waitForHealth(port);
   // eslint-disable-next-line no-console
-  console.log(`Bloom Console ready: http://localhost:${port}/console`);
+  console.log(`✅ Console ready: http://localhost:${port}/console`);
+  // eslint-disable-next-line no-console
+  console.log(`✅ Using DB_PATH: ${config.DB_PATH}`);
   // eslint-disable-next-line no-console
   console.log("✅ Connected. Test succeeded");
 
