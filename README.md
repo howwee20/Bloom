@@ -2,6 +2,19 @@
 
 Provider-agnostic constraint runtime for agents in a persistent environment.
 
+## Console Quickstart (Local)
+
+Prereqs
+- Node 20
+- pnpm
+
+Run (deterministic)
+1. `./scripts/console.sh`
+
+Notes
+- Default kernel DB: `/Users/ejhowe/Bloom-clean/data/kernel.db` (if present).
+- If that file is missing, set `DB_PATH` or export `ALLOW_NEW_KERNEL=true` to create a new kernel DB.
+
 Key rules
 - Fail closed by default: if environment freshness is stale/unknown, `can_do` and `execute` are rejected; `execute` may be overridden via `override_freshness`.
 - Irreversible truth: append-only event log with hash chaining.

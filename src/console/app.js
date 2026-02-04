@@ -9,6 +9,8 @@ const state = {
   stepUpError: "",
   streaming: false,
   lastUpdatedAt: null,
+  lastActivity: [],
+  highlightRecordId: null,
   refreshTimer: null,
   updatedTimer: null,
   abortController: null
@@ -103,11 +105,43 @@ function formatMoney(cents) {
 }
 
 function setError(message) {
-  elements.sessionError.textContent = message || "";
+  elements.sessionError.textContent = message ? mapErrorMessage(message) : "";
 }
 
 function setAdvancedError(message) {
-  elements.advancedError.textContent = message || "";
+  elements.advancedError.textContent = message ? mapErrorMessage(message) : "";
+}
+
+function mapErrorMessage(message) {
+  const text = String(message || "").trim();
+  const lower = text.toLowerCase();
+  if (text === "anthropic_api_key_missing") {
+    return "AI unavailable. Add your API key.";
+  }
+  if (lower.includes("anthropic") && lower.includes("error")) {
+    return "AI unavailable. Check your API key and model.";
+  }
+  if (lower.includes("model") && lower.includes("not found")) {
+    return "AI unavailable. Model is invalid.";
+  }
+  if (text === "invalid_console_session" || text === "api_key_required" || text === "invalid_api_key") {
+    return "Session expired. Please reconnect.";
+  }
+  if (text === "bootstrap_token_required") {
+    return "Bootstrap code required.";
+  }
+  if (text === "confirm_required") {
+    return "Type CREATE to confirm.";
+  }
+  if (text === "console_session_agent_mismatch") {
+    return "Session does not match this Bloom.";
+  }
+  if (text === "no_agents_found") {
+    return "No existing Bloom found in this database.";
+  }
+  if (!text) return "Something went wrong.";
+  if (text.length > 140) return "Something went wrong. Please try again.";
+  return text;
 }
 
 function updateEmptyState() {
@@ -126,6 +160,14 @@ function renderMessages() {
     const bubble = document.createElement("div");
     bubble.className = `message message--${msg.role}`;
     bubble.textContent = msg.content;
+    if (msg.showRecordLink) {
+      const link = document.createElement("button");
+      link.type = "button";
+      link.className = "message__link";
+      link.textContent = "View record";
+      link.addEventListener("click", () => openRecordHighlight());
+      bubble.appendChild(link);
+    }
     elements.chatMessages.appendChild(bubble);
   });
 
@@ -138,6 +180,29 @@ function renderMessages() {
 
   elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
   updateEmptyState();
+}
+
+function shouldShowRecordLink(text) {
+  const lower = String(text || "").toLowerCase();
+  return (
+    lower.includes("transaction") ||
+    lower.includes("transfer") ||
+    lower.includes("pending") ||
+    lower.includes("confirmed") ||
+    lower.includes("record") ||
+    lower.includes("receipt")
+  );
+}
+
+function openRecordHighlight() {
+  const latest = state.lastActivity?.[0];
+  if (latest?.id) {
+    state.highlightRecordId = latest.id;
+  } else {
+    state.highlightRecordId = null;
+  }
+  toggleDetails(true);
+  renderRecord(state.lastActivity || []);
 }
 
 function renderPendingQuotes() {
@@ -232,6 +297,7 @@ function renderStepUpCard() {
 
 function renderRecord(activity) {
   elements.recordList.innerHTML = "";
+  state.lastActivity = activity || [];
   if (!activity || activity.length === 0) {
     const empty = document.createElement("div");
     empty.className = "record-item";
@@ -243,6 +309,10 @@ function renderRecord(activity) {
   activity.forEach((item) => {
     const row = document.createElement("div");
     row.className = "record-item";
+    row.dataset.recordId = item.id || "";
+    if (state.highlightRecordId && item.id === state.highlightRecordId) {
+      row.classList.add("record-item--highlight");
+    }
 
     const title = document.createElement("strong");
     title.textContent = item.line;
@@ -263,6 +333,15 @@ function renderRecord(activity) {
 
     elements.recordList.appendChild(row);
   });
+
+  if (state.highlightRecordId) {
+    const highlighted = elements.recordList.querySelector(
+      `[data-record-id="${state.highlightRecordId}"]`
+    );
+    if (highlighted) {
+      highlighted.scrollIntoView({ block: "center" });
+    }
+  }
 }
 
 function updateUpdatedLabel() {
@@ -284,6 +363,14 @@ function updateUpdatedLabel() {
     const days = Math.floor(diff / 86400);
     elements.updatedLabel.textContent = `Updated ${days}d ago`;
   }
+}
+
+function isSessionError(message) {
+  return (
+    message === "invalid_console_session" ||
+    message === "api_key_required" ||
+    message === "invalid_api_key"
+  );
 }
 
 async function apiFetch(path, options = {}) {
@@ -336,6 +423,11 @@ async function refreshOverview() {
     return true;
   } catch (err) {
     console.error(err);
+    const message = err?.message || "";
+    if (isSessionError(message)) {
+      disconnect();
+      setError(message);
+    }
     return false;
   }
 }
@@ -375,7 +467,11 @@ async function handleChatSubmit(event) {
     });
 
     if (response?.assistant) {
-      state.messages.push({ role: "assistant", content: response.assistant });
+      state.messages.push({
+        role: "assistant",
+        content: response.assistant,
+        showRecordLink: shouldShowRecordLink(response.assistant)
+      });
     }
     state.pendingQuotes = (response?.pending_quotes || []).map((quote) => ({
       ...quote,
@@ -388,7 +484,7 @@ async function handleChatSubmit(event) {
     if (err.name === "AbortError") {
       state.messages.push({ role: "assistant", content: "Stopped." });
     } else {
-      state.messages.push({ role: "assistant", content: `Error: ${err.message}` });
+      state.messages.push({ role: "assistant", content: mapErrorMessage(err.message) });
     }
     renderMessages();
   } finally {
@@ -418,7 +514,7 @@ async function handleApproval(quote) {
     }
     await executeQuote(quote.quote_id, quote.idempotency_key);
   } catch (err) {
-    state.stepUpError = err.message;
+    state.stepUpError = mapErrorMessage(err.message);
     renderMessages();
   }
 }
@@ -463,7 +559,7 @@ async function confirmStepUp(code) {
     if (!token) throw new Error("No step-up token returned.");
     await executeQuote(state.stepUp.quote_id, state.stepUp.idempotency_key, token);
   } catch (err) {
-    state.stepUpError = err.message;
+    state.stepUpError = mapErrorMessage(err.message);
     renderMessages();
   }
 }

@@ -722,6 +722,13 @@ export function buildServer(options: {
     return reply.type("text/css").send(css);
   });
 
+  app.get("/console/theme.css", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("theme.css");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const css = fs.readFileSync(assetPath, "utf8");
+    return reply.type("text/css").send(css);
+  });
+
   app.post("/console/bootstrap", { config: { auth: "public" } }, async (request, reply) => {
     const body = (request.body ?? {}) as { bootstrap_token?: string; confirm_text?: string };
     if (!allowConsoleBootstrap(config, request, reply, body.bootstrap_token)) return;

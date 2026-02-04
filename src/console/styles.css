@@ -1,19 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Zen+Dots&display=swap");
-
-:root {
-  color-scheme: light;
-  --bg: #fff9f3;
-  --surface: rgba(255, 255, 255, 0.75);
-  --surface-strong: rgba(255, 255, 255, 0.95);
-  --text: #2a1c14;
-  --muted: rgba(76, 46, 28, 0.6);
-  --border: rgba(76, 46, 28, 0.18);
-  --shadow: 0 20px 50px rgba(160, 90, 40, 0.12);
-  --accent: #ff7a2f;
-  --accent-weak: #ffe4d2;
-  --success: #2b8a84;
-  --danger: #d95b4b;
-}
+@import url("/console/theme.css");
 
 * {
   box-sizing: border-box;
@@ -136,6 +121,21 @@ body {
   max-width: 90%;
   line-height: 1.5;
   white-space: pre-wrap;
+}
+
+.message__link {
+  margin-top: 8px;
+  background: none;
+  border: none;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  text-align: left;
+}
+
+.message__link:hover {
+  text-decoration: underline;
 }
 
 .message--user {
@@ -447,6 +447,11 @@ body {
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.9);
   font-size: 13px;
+}
+
+.record-item--highlight {
+  border-color: rgba(255, 122, 47, 0.6);
+  box-shadow: 0 0 0 3px rgba(255, 122, 47, 0.12);
 }
 
 .record-item strong {
