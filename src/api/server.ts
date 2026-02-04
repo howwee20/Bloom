@@ -373,11 +373,12 @@ export function buildServer(options: {
   env?: IEnvironment;
 } = {}) {
   const config = options.config ?? getConfig();
+  const consoleDbPath = config.CONSOLE_DB_PATH ?? config.DB_PATH;
   if (config.DB_PATH !== ":memory:" && config.DB_PATH !== "file::memory:") {
     ensureDbPath(config.DB_PATH);
   }
-  if (config.CONSOLE_DB_PATH !== ":memory:" && config.CONSOLE_DB_PATH !== "file::memory:") {
-    ensureDbPath(config.CONSOLE_DB_PATH);
+  if (consoleDbPath && consoleDbPath !== ":memory:" && consoleDbPath !== "file::memory:") {
+    ensureDbPath(consoleDbPath);
   }
   const { sqlite, db } =
     options.db && options.sqlite
@@ -386,9 +387,9 @@ export function buildServer(options: {
   const consoleDbBundle =
     options.consoleDb && options.consoleSqlite
       ? { sqlite: options.consoleSqlite, db: options.consoleDb }
-      : config.CONSOLE_DB_PATH === config.DB_PATH
+      : consoleDbPath === config.DB_PATH
         ? { sqlite, db }
-        : createDatabase(config.CONSOLE_DB_PATH);
+        : createDatabase(consoleDbPath);
   const consoleDb = consoleDbBundle.db;
 
   const env =
