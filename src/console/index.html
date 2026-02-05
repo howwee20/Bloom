@@ -55,7 +55,7 @@
             </div>
             <div class="chat__messages" id="chatMessages"></div>
             <form class="chat__composer" id="chatForm">
-              <input id="chatInput" placeholder="Ask: “How much do I have?”" autocomplete="off" />
+              <input id="chatInput" placeholder="Ask: &ldquo;How much do I have?&rdquo;" autocomplete="off" />
               <button class="btn btn--danger" id="stopButton" type="button">Stop</button>
               <button class="btn btn--primary" id="sendButton" type="submit">Send</button>
             </form>
@@ -79,25 +79,25 @@
               </div>
               <div class="stat">
                 <span>Available</span>
-                <strong id="availableValue">—</strong>
+                <strong id="availableValue">&mdash;</strong>
               </div>
               <div class="stat">
                 <span>Confirmed</span>
-                <strong id="confirmedValue">—</strong>
+                <strong id="confirmedValue">&mdash;</strong>
               </div>
               <div class="stat">
                 <span>Reserved</span>
-                <strong id="reservedValue">—</strong>
+                <strong id="reservedValue">&mdash;</strong>
               </div>
               <div class="divider"></div>
               <div class="field">
-                <span>Wallet</span>
+                <span>Address</span>
                 <div class="inline">
-                  <input id="walletAddress" readonly value="—" />
+                  <input id="walletAddress" readonly value="&mdash;" />
                   <button class="btn btn--ghost" id="copyAddress" type="button">Copy</button>
                 </div>
               </div>
-              <p class="hint" id="fundingHint">Add funds by sending USDC to the wallet address.</p>
+              <p class="hint" id="fundingHint">Add funds by sending USDC to this address.</p>
               <button class="btn btn--danger-outline" id="freezeButton" type="button">Freeze Account</button>
             </div>
 
@@ -117,7 +117,7 @@
       <div class="modal__content">
         <h3>Approve Spend</h3>
         <p>Step-up required. Use the code below to approve this spend.</p>
-        <div class="step-up__code" id="stepUpCode">—</div>
+        <div class="step-up__code" id="stepUpCode">&mdash;</div>
         <div class="actions">
           <button class="btn" id="stepUpCancel">Cancel</button>
           <button class="btn btn--primary" id="stepUpApprove">Approve</button>

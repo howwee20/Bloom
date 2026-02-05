@@ -1,3 +1,4 @@
+import "dotenv/config";
 import Fastify from "fastify";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import fs from "node:fs";
@@ -9,6 +10,8 @@ import { getConfig } from "../config.js";
 import { Kernel } from "../kernel/kernel.js";
 import { SimpleEconomyWorld } from "../env/simple_economy.js";
 import { BaseUsdcWorld } from "../env/base_usdc.js";
+import { buildUiActivity, formatMoney, shortenAddress } from "../presentation/index.js";
+import { getAddress } from "viem";
 import {
   agentSpendSnapshot,
   agentTokens,
@@ -22,9 +25,12 @@ import {
   policies,
   quotes,
   receipts,
+  baseUsdcActionDedup,
+  baseUsdcPendingTxs,
   stepUpChallenges,
   users
 } from "../db/schema.js";
+import { consoleSessions } from "../db/console_schema.js";
 import { and, desc, eq } from "drizzle-orm";
 import type { DbClient } from "../db/database.js";
 import Database from "better-sqlite3";
@@ -34,7 +40,15 @@ import { appendEvent } from "../kernel/events.js";
 import { createReceipt } from "../kernel/receipts.js";
 import { refreshAgentSpendSnapshot } from "../kernel/spend_snapshot.js";
 import { CARD_SIGNATURE_HEADER, CARD_TIMESTAMP_HEADER, verifyCardSignature } from "./card_webhook.js";
-import { buildUiActivity, formatMoney, shortenAddress } from "../presentation/index.js";
+import {
+  LITHIC_WEBHOOK_ID_HEADER,
+  LITHIC_WEBHOOK_TIMESTAMP_HEADER,
+  LITHIC_WEBHOOK_SIGNATURE_HEADER,
+  verifyLithicWebhookSignature,
+  mapLithicToCanonical,
+  type LithicASARequest,
+  type LithicASAResponse
+} from "./lithic_webhook.js";
 
 type AuthUser = {
   userId: string;
@@ -45,6 +59,7 @@ type AuthUser = {
 declare module "fastify" {
   interface FastifyRequest {
     authUser?: AuthUser;
+    consoleSession?: { sessionId: string; userId: string; agentId: string };
   }
 }
 
@@ -115,6 +130,40 @@ function requireScope(
     return false;
   }
   return true;
+}
+
+function ensureConsoleAgentMatch(request: FastifyRequest, reply: FastifyReply, agentId: string) {
+  const session = request.consoleSession;
+  if (!session) return true;
+  if (session.agentId !== agentId) {
+    reply.status(403).send({ error: "console_session_agent_mismatch" });
+    return false;
+  }
+  return true;
+}
+
+function selectDefaultAgent(db: DbClient) {
+  return db
+    .select()
+    .from(agents)
+    .orderBy(desc(agents.updatedAt), desc(agents.createdAt))
+    .limit(1)
+    .get() as typeof agents.$inferSelect | undefined;
+}
+
+function createConsoleSessionRow(input: { consoleDb: DbClient; userId: string; agentId: string; apiKey: string }) {
+  const now = nowSeconds();
+  const sessionId = newId("console");
+  input.consoleDb.insert(consoleSessions).values({
+    sessionId,
+    userId: input.userId,
+    agentId: input.agentId,
+    apiKey: input.apiKey,
+    status: "active",
+    createdAt: now,
+    lastUsedAt: now
+  }).run();
+  return sessionId;
 }
 
 function parseWindowSeconds(value: string | undefined, fallbackSeconds: number) {
@@ -269,6 +318,39 @@ function summarizeIntent(intent: Record<string, unknown>) {
   return `Intent: ${type || "unknown"}`;
 }
 
+function parseAmountCents(value: unknown) {
+  const numeric = typeof value === "string" ? Number(value) : Number(value);
+  if (!Number.isFinite(numeric) || !Number.isInteger(numeric)) return null;
+  return numeric;
+}
+
+function normalizeEvmAddress(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (!/^0x[a-fA-F0-9]{40}$/.test(raw)) return null;
+  try {
+    return getAddress(raw);
+  } catch {
+    return null;
+  }
+}
+
+function extractUsdcTransferDetails(intent: Record<string, unknown>) {
+  if (String(intent.type ?? "") !== "usdc_transfer") return null;
+  const amount = Number(intent.amount_cents ?? 0);
+  const toAddress = String(intent.to_address ?? "");
+  return {
+    intent_type: "usdc_transfer",
+    amount_cents: Number.isFinite(amount) ? amount : null,
+    to_address: toAddress || null
+  };
+}
+
+function looksLikeTxHash(value: string | null | undefined) {
+  if (!value) return false;
+  return /^0x[a-fA-F0-9]{64}$/.test(value);
+}
+
 type CardAuthResponse = {
   approved: boolean;
   shadow: boolean;
@@ -368,22 +450,42 @@ export function buildServer(options: {
   config?: ReturnType<typeof getConfig>;
   db?: DbClient;
   sqlite?: Database;
+  consoleDb?: DbClient;
+  consoleSqlite?: Database;
   env?: IEnvironment;
 } = {}) {
   const config = options.config ?? getConfig();
-  if (config.DB_PATH !== ":memory:" && config.DB_PATH !== "file::memory:") {
+  const isMemoryPath = (value: string) => value === ":memory:" || value === "file::memory:";
+  if (!isMemoryPath(config.DB_PATH)) {
     ensureDbPath(config.DB_PATH);
   }
-  const { sqlite, db } =
+  const kernelBundle =
     options.db && options.sqlite
       ? { sqlite: options.sqlite, db: options.db }
       : createDatabase(config.DB_PATH);
+
+  const consoleDbPath = config.CONSOLE_DB_PATH ?? config.DB_PATH;
+  if (!isMemoryPath(consoleDbPath)) {
+    ensureDbPath(consoleDbPath);
+  }
+  const consoleBundle =
+    options.consoleDb && options.consoleSqlite
+      ? { sqlite: options.consoleSqlite, db: options.consoleDb }
+      : consoleDbPath === config.DB_PATH
+        ? kernelBundle
+        : createDatabase(consoleDbPath);
+
   const env =
     options.env ??
     (config.ENV_TYPE === "base_usdc"
-      ? new BaseUsdcWorld(db, sqlite, config)
-      : new SimpleEconomyWorld(db, sqlite, config));
-  const kernel = new Kernel(db, sqlite, env, config);
+      ? new BaseUsdcWorld(kernelBundle.db, kernelBundle.sqlite, config)
+      : new SimpleEconomyWorld(kernelBundle.db, kernelBundle.sqlite, config));
+  const kernel = new Kernel(kernelBundle.db, kernelBundle.sqlite, env, config);
+
+  const db = kernelBundle.db;
+  const sqlite = kernelBundle.sqlite;
+  const consoleDb = consoleBundle.db;
+  const consoleSqlite = consoleBundle.sqlite;
 
   const app = Fastify({ logger: true });
 
@@ -391,6 +493,9 @@ export function buildServer(options: {
   const RATE_LIMIT_WINDOW_SECONDS = 60;
   const RATE_LIMIT_MAX_PER_KEY = 60;
   const RATE_LIMIT_MAX_PER_IP = 120;
+  const TRANSFER_QUOTE_RATE_MAX = 12;
+  const TRANSFER_APPROVE_RATE_MAX = 6;
+  const TRANSFER_STEP_UP_RATE_MAX = 6;
   const consoleStateId = "default";
 
   app.get("/healthz", { config: { auth: "public" } }, async (_request, reply) => {
@@ -421,6 +526,34 @@ export function buildServer(options: {
     if (existing.count >= max) return false;
     existing.count += 1;
     return true;
+  }
+
+  function resolveTransferTxHash(input: {
+    agentId: string;
+    quoteId: string;
+    idempotencyKey: string;
+    fallback?: string;
+  }) {
+    const pending = db
+      .select()
+      .from(baseUsdcPendingTxs)
+      .where(and(eq(baseUsdcPendingTxs.agentId, input.agentId), eq(baseUsdcPendingTxs.quoteId, input.quoteId)))
+      .orderBy(desc(baseUsdcPendingTxs.createdAt))
+      .get() as typeof baseUsdcPendingTxs.$inferSelect | undefined;
+    if (pending?.txHash) return pending.txHash;
+    const dedup = db
+      .select()
+      .from(baseUsdcActionDedup)
+      .where(
+        and(
+          eq(baseUsdcActionDedup.agentId, input.agentId),
+          eq(baseUsdcActionDedup.idempotencyKey, input.idempotencyKey)
+        )
+      )
+      .get() as typeof baseUsdcActionDedup.$inferSelect | undefined;
+    if (dedup?.txHash) return dedup.txHash;
+    if (looksLikeTxHash(input.fallback)) return input.fallback as string;
+    return null;
   }
 
   function getConsoleState() {
@@ -469,7 +602,9 @@ export function buildServer(options: {
   }
 
   app.addHook("preHandler", async (request, reply) => {
-    const configAuth = request.routeOptions.config as { auth?: "admin" | "public" | "user" } | undefined;
+    const configAuth = request.routeOptions.config as
+      | { auth?: "admin" | "public" | "user" | "console" }
+      | undefined;
     const authMode = configAuth?.auth ?? "user";
     if (authMode === "admin" || authMode === "public") return;
 
@@ -478,6 +613,51 @@ export function buildServer(options: {
     if (!consumeRate(ipKey, RATE_LIMIT_MAX_PER_IP, now)) {
       reply.status(429).send({ error: "rate_limited" });
       return;
+    }
+
+    if (authMode === "console") {
+      const sessionId = String(request.headers["x-console-session"] ?? "");
+      if (sessionId) {
+        const session = consoleDb
+          .select()
+          .from(consoleSessions)
+          .where(eq(consoleSessions.sessionId, sessionId))
+          .get() as typeof consoleSessions.$inferSelect | undefined;
+        if (!session || session.status !== "active") {
+          reply.status(401).send({ error: "invalid_console_session" });
+          return;
+        }
+
+        const keyHash = hashApiKey(session.apiKey);
+        if (!consumeRate(`key:${keyHash}`, RATE_LIMIT_MAX_PER_KEY, now)) {
+          reply.status(429).send({ error: "rate_limited" });
+          return;
+        }
+
+        const keyRow = db.select().from(apiKeys).where(eq(apiKeys.keyHash, keyHash)).get();
+        if (!keyRow || keyRow.status !== "active") {
+          reply.status(401).send({ error: "invalid_api_key" });
+          return;
+        }
+
+        consoleDb
+          .update(consoleSessions)
+          .set({ lastUsedAt: now })
+          .where(eq(consoleSessions.sessionId, sessionId))
+          .run();
+
+        request.consoleSession = {
+          sessionId: session.sessionId,
+          userId: session.userId,
+          agentId: session.agentId
+        };
+        request.authUser = {
+          userId: keyRow.userId,
+          keyId: keyRow.keyId,
+          scopes: parseScopes(keyRow.scopesJson)
+        };
+        return;
+      }
     }
 
     const apiKey = String(request.headers["x-api-key"] ?? "");
@@ -710,6 +890,38 @@ export function buildServer(options: {
     return reply.type("text/css").send(css);
   });
 
+  app.get("/console/theme.css", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("theme.css");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
+    return reply.type("text/css").send(css);
+  });
+
+  app.get("/console/architecture", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("architecture.html");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const html = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
+    return reply.type("text/html").send(html);
+  });
+
+  app.get("/console/architecture.css", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("architecture.css");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
+    return reply.type("text/css").send(css);
+  });
+
+  app.get("/console/architecture.js", { config: { auth: "public" } }, async (_request, reply) => {
+    const assetPath = resolveConsoleAsset("architecture.js");
+    if (!assetPath) return reply.status(404).send("Not found");
+    const js = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
+    return reply.type("text/javascript").send(js);
+  });
+
   app.post("/console/login", { config: { auth: "public" } }, handleConsoleLogin);
   app.post("/console/bootstrap", { config: { auth: "public" } }, handleConsoleLogin);
 
@@ -755,7 +967,7 @@ export function buildServer(options: {
     const tools = [
       {
         name: "kernel_state",
-        description: "Get current spend power and wallet state for the agent.",
+        description: "Get current spend power and account state for the agent.",
         input_schema: { type: "object", properties: {} }
       },
       {
@@ -788,6 +1000,9 @@ export function buildServer(options: {
       expires_at: number;
       idempotency_key: string;
       summary: string;
+      intent_type?: string | null;
+      amount_cents?: number | null;
+      to_address?: string | null;
     }> = [];
 
     const toolHandlers = {
@@ -806,6 +1021,7 @@ export function buildServer(options: {
           intent_json: intent,
           idempotency_key: idempotencyKey
         });
+        const transferDetails = extractUsdcTransferDetails(intent);
         pendingQuotes.push({
           quote_id: quote.quote_id,
           allowed: quote.allowed,
@@ -813,7 +1029,10 @@ export function buildServer(options: {
           reason: quote.reason,
           expires_at: quote.expires_at,
           idempotency_key: quote.idempotency_key,
-          summary: summarizeIntent(intent)
+          summary: summarizeIntent(intent),
+          intent_type: transferDetails?.intent_type ?? null,
+          amount_cents: transferDetails?.amount_cents ?? null,
+          to_address: transferDetails?.to_address ?? null
         });
         return {
           quote_id: quote.quote_id,
@@ -925,6 +1144,266 @@ export function buildServer(options: {
     reply.raw.end();
   });
 
+  app.post("/console/actions/transfer/quote", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:quote:${session.sessionId}`, TRANSFER_QUOTE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body2 = (request.body ?? {}) as { amount_cents?: number | string; to_address?: string };
+    const amountCents = parseAmountCents(body2.amount_cents);
+    if (!amountCents || amountCents <= 0) {
+      return reply.status(400).send({ error: "invalid_amount_cents" });
+    }
+    const toAddress = normalizeEvmAddress(body2.to_address);
+    if (!toAddress) {
+      return reply.status(400).send({ error: "invalid_to_address" });
+    }
+
+    const intent = { type: "usdc_transfer", amount_cents: amountCents, to_address: toAddress };
+    const idempotencyKey = newId("idem");
+    const quote = await kernel.canDo({
+      user_id: session.userId,
+      agent_id: session.agentId,
+      intent_json: intent,
+      idempotency_key: idempotencyKey
+    });
+
+    return reply.send({
+      quote_id: quote.quote_id,
+      allowed: quote.allowed,
+      requires_step_up: quote.requires_step_up,
+      reason: quote.reason,
+      expires_at: quote.expires_at,
+      idempotency_key: quote.idempotency_key,
+      summary: summarizeIntent(intent),
+      intent_type: "usdc_transfer",
+      amount_cents: amountCents,
+      to_address: toAddress
+    });
+  });
+
+  app.post("/console/actions/transfer/approve", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:approve:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body2 = (request.body ?? {}) as { quote_id?: string };
+    if (!body2.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body2.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    if (quote.expiresAt <= now) {
+      return reply.status(400).send({ error: "quote_expired" });
+    }
+    if (quote.allowed !== 1) {
+      return reply.status(400).send({ error: "quote_not_allowed" });
+    }
+    const cancelled = db
+      .select()
+      .from(receipts)
+      .where(and(eq(receipts.externalRef, quote.quoteId), eq(receipts.whatHappened, "Quote cancelled by user.")))
+      .get();
+    if (cancelled) {
+      return reply.status(400).send({ error: "quote_cancelled" });
+    }
+
+    if (quote.requiresStepUp === 1) {
+      const challenge = await kernel.requestStepUpChallenge({
+        user_id: session.userId,
+        agent_id: session.agentId,
+        quote_id: quote.quoteId
+      });
+      return reply.send({
+        status: "step_up_required",
+        step_up_id: challenge.challenge_id,
+        expires_at: challenge.expires_at,
+        prompt: "Enter the code",
+        code: challenge.code
+      });
+    }
+
+    const result = await kernel.execute({
+      quote_id: quote.quoteId,
+      idempotency_key: quote.idempotencyKey
+    });
+
+    if (result.status === "rejected" && result.reason === "step_up_required") {
+      const challenge = await kernel.requestStepUpChallenge({
+        user_id: session.userId,
+        agent_id: session.agentId,
+        quote_id: quote.quoteId
+      });
+      return reply.send({
+        status: "step_up_required",
+        step_up_id: challenge.challenge_id,
+        expires_at: challenge.expires_at,
+        prompt: "Enter the code",
+        code: challenge.code
+      });
+    }
+    if (result.status === "rejected") {
+      return reply.status(400).send({ error: result.reason ?? "execution_rejected" });
+    }
+    if (result.status === "failed") {
+      return reply.status(400).send({ error: result.reason ?? "execution_failed" });
+    }
+
+    const intent = parseJson<Record<string, unknown>>(quote.intentJson, {});
+    const details = extractUsdcTransferDetails(intent);
+    const txHash = resolveTransferTxHash({
+      agentId: quote.agentId,
+      quoteId: quote.quoteId,
+      idempotencyKey: quote.idempotencyKey,
+      fallback: result.external_ref
+    });
+    const recordId = txHash ?? quote.quoteId;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[transfer] amount_cents=${details?.amount_cents ?? "unknown"} to_address=${details?.to_address ?? "unknown"} tx_hash=${txHash ?? "unknown"} record_id=${recordId}`
+    );
+
+    return reply.send({
+      status: "executed",
+      tx_hash: txHash,
+      record_id: recordId
+    });
+  });
+
+  app.post("/console/actions/transfer/cancel", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:cancel:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body2 = (request.body ?? {}) as { quote_id?: string };
+    if (!body2.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body2.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+
+    const existing = db
+      .select()
+      .from(receipts)
+      .where(and(eq(receipts.externalRef, quote.quoteId), eq(receipts.whatHappened, "Quote cancelled by user.")))
+      .get();
+    if (!existing) {
+      const event = appendEvent(db, sqlite, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        type: "quote_cancelled",
+        payload: { quote_id: quote.quoteId }
+      });
+      createReceipt(db, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: quote.quoteId,
+        whatHappened: "Quote cancelled by user.",
+        whyChanged: "cancelled",
+        whatHappensNext: "Request a new quote."
+      });
+    }
+
+    return reply.send({ status: "cancelled" });
+  });
+
+  app.post("/console/actions/step_up/confirm", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:step_up:${session.sessionId}`, TRANSFER_STEP_UP_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body2 = (request.body ?? {}) as { step_up_id?: string; code?: string };
+    if (!body2.step_up_id || !body2.code) {
+      return reply.status(400).send({ error: "step_up_id_and_code_required" });
+    }
+
+    const challenge = db
+      .select()
+      .from(stepUpChallenges)
+      .where(eq(stepUpChallenges.id, body2.step_up_id))
+      .get();
+    if (!challenge) return reply.status(404).send({ error: "challenge_not_found" });
+    if (challenge.agentId !== session.agentId || challenge.userId !== session.userId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+
+    const confirmation = await kernel.confirmStepUpChallenge({
+      challenge_id: body2.step_up_id,
+      code: body2.code,
+      decision: "approve"
+    });
+    if (!confirmation.ok) {
+      return reply.status(400).send({ error: confirmation.reason ?? "step_up_failed" });
+    }
+
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, challenge.quoteId)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    if (quote.expiresAt <= nowSeconds()) {
+      return reply.status(400).send({ error: "quote_expired" });
+    }
+
+    const result = await kernel.execute({
+      quote_id: quote.quoteId,
+      idempotency_key: quote.idempotencyKey,
+      step_up_token: confirmation.response.step_up_token
+    });
+    if (result.status === "rejected") {
+      return reply.status(400).send({ error: result.reason ?? "execution_rejected" });
+    }
+    if (result.status === "failed") {
+      return reply.status(400).send({ error: result.reason ?? "execution_failed" });
+    }
+
+    const intent = parseJson<Record<string, unknown>>(quote.intentJson, {});
+    const details = extractUsdcTransferDetails(intent);
+    const txHash = resolveTransferTxHash({
+      agentId: quote.agentId,
+      quoteId: quote.quoteId,
+      idempotencyKey: quote.idempotencyKey,
+      fallback: result.external_ref
+    });
+    const recordId = txHash ?? quote.quoteId;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[transfer] amount_cents=${details?.amount_cents ?? "unknown"} to_address=${details?.to_address ?? "unknown"} tx_hash=${txHash ?? "unknown"} record_id=${recordId}`
+    );
+
+    return reply.send({
+      status: "executed",
+      tx_hash: txHash,
+      record_id: recordId
+    });
+  });
+
   app.post("/console/execute", { config: { auth: "public" } }, async (request, reply) => {
     const session = requireConsoleSession(request, reply);
     if (!session) return;
@@ -932,6 +1411,7 @@ export function buildServer(options: {
       quote_id?: string;
       idempotency_key?: string;
       step_up_token?: string;
+      override_freshness?: boolean;
     };
     if (!body.quote_id || !body.idempotency_key) {
       return reply.status(400).send({ error: "quote_id_and_idempotency_key_required" });
@@ -939,7 +1419,8 @@ export function buildServer(options: {
     const result = await kernel.execute({
       quote_id: body.quote_id,
       idempotency_key: body.idempotency_key,
-      step_up_token: body.step_up_token
+      step_up_token: body.step_up_token,
+      override_freshness: body.override_freshness
     });
     return reply.send(result);
   });
@@ -976,10 +1457,42 @@ export function buildServer(options: {
   app.post("/console/freeze", { config: { auth: "public" } }, async (request, reply) => {
     const session = requireConsoleSession(request, reply);
     if (!session) return;
-    const body = request.body as { reason?: string };
-    const result = kernel.freezeAgent(session.agentId, body.reason ?? "console_freeze");
+    const body2 = request.body as { reason?: string };
+    const result = kernel.freezeAgent(session.agentId, body2.reason ?? "console_freeze");
     return reply.send(result);
   });
+
+  app.get("/console/debug", { config: { auth: "public" } }, async (request, reply) => {
+    if (!isLoopback(request.ip) || process.env.NODE_ENV === "production") {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    const agent = selectDefaultAgent(db);
+    if (!agent) {
+      return reply.send({
+        db_path: config.DB_PATH,
+        console_db_path: config.CONSOLE_DB_PATH,
+        agent_id: null,
+        wallet_address: null,
+        confirmed_balance_cents: null,
+        available_cents: null,
+        confirmed: null,
+        available: null
+      });
+    }
+    const state = await kernel.getState(agent.agentId);
+    const spend = state?.spend_power ?? {};
+    return reply.send({
+      db_path: config.DB_PATH,
+      console_db_path: config.CONSOLE_DB_PATH,
+      agent_id: agent.agentId,
+      wallet_address: state?.observation?.wallet_address ?? null,
+      confirmed_balance_cents: spend.confirmed_balance_cents ?? null,
+      available_cents: spend.effective_spend_power_cents ?? null,
+      confirmed: spend.confirmed_balance_cents ?? null,
+      available: spend.effective_spend_power_cents ?? null
+    });
+  });
+
 
   app.post("/api/card/auth", { config: { auth: "public" } }, async (request, reply) => {
     const body = request.body as {
@@ -1427,6 +1940,272 @@ export function buildServer(options: {
     return reply.send({ ok: true });
   });
 
+  // Lithic ASA (Auth Stream Access) responder endpoint
+  // This endpoint receives real-time authorization requests from Lithic
+  // Must respond within 3 seconds (Lithic times out at 6 seconds)
+  app.post("/webhooks/lithic/asa", { config: { auth: "public" } }, async (request, reply) => {
+    const startTime = Date.now();
+    const cardMode = config.CARD_MODE;
+
+    // Get raw body for signature verification
+    const rawBody = JSON.stringify(request.body);
+    const webhookId = String(request.headers[LITHIC_WEBHOOK_ID_HEADER] ?? "");
+    const webhookTimestamp = String(request.headers[LITHIC_WEBHOOK_TIMESTAMP_HEADER] ?? "");
+    const webhookSignature = String(request.headers[LITHIC_WEBHOOK_SIGNATURE_HEADER] ?? "");
+
+    let authStatus = "signed";
+
+    // Signature verification (fail-closed in shadow/enforce modes)
+    if (cardMode !== "dev") {
+      if (!config.LITHIC_ASA_SECRET) {
+        // eslint-disable-next-line no-console
+        console.error("[lithic-asa] LITHIC_ASA_SECRET not configured, failing closed");
+        const response: LithicASAResponse = { result: "DECLINED" };
+        return reply.send(response);
+      }
+
+      const verification = verifyLithicWebhookSignature({
+        secret: config.LITHIC_ASA_SECRET,
+        webhookId,
+        webhookTimestamp,
+        webhookSignature,
+        rawBody,
+        now: nowSeconds()
+      });
+
+      if (!verification.ok) {
+        // eslint-disable-next-line no-console
+        console.error(`[lithic-asa] Signature verification failed: ${verification.reason}`);
+        const response: LithicASAResponse = { result: "DECLINED" };
+        return reply.send(response);
+      }
+    } else {
+      // Dev mode: log but don't fail on missing/invalid signature
+      if (!config.LITHIC_ASA_SECRET || !webhookSignature) {
+        authStatus = "dev_unsigned";
+      } else {
+        const verification = verifyLithicWebhookSignature({
+          secret: config.LITHIC_ASA_SECRET,
+          webhookId,
+          webhookTimestamp,
+          webhookSignature,
+          rawBody,
+          now: nowSeconds()
+        });
+        authStatus = verification.ok ? "signed" : "dev_unsigned";
+      }
+    }
+
+    // Parse and map Lithic payload to canonical format
+    const lithicPayload = request.body as LithicASARequest;
+    const canonical = mapLithicToCanonical(lithicPayload);
+
+    const { auth_id: authId, card_id: cardId, agent_id: agentId, amount_cents: amountCents } = canonical;
+
+    if (!authId || !agentId || !Number.isFinite(amountCents) || amountCents <= 0) {
+      // eslint-disable-next-line no-console
+      console.error("[lithic-asa] Invalid request payload", { authId, agentId, amountCents });
+      const response: LithicASAResponse = { result: "DECLINED" };
+      return reply.send(response);
+    }
+
+    // Check for existing hold (idempotency)
+    const existingReceipt = db
+      .select()
+      .from(receipts)
+      .where(eq(receipts.externalRef, authId))
+      .orderBy(desc(receipts.createdAt))
+      .get();
+    if (existingReceipt?.eventId) {
+      const event = db.select().from(events).where(eq(events.eventId, existingReceipt.eventId)).get();
+      const payload = event ? parseJson<Record<string, unknown>>(event.payloadJson, {}) : {};
+      const cachedResponse = payload.lithic_response as LithicASAResponse | undefined;
+      if (cachedResponse) {
+        return reply.send(cachedResponse);
+      }
+    }
+
+    const existingHold = db.select().from(cardHolds).where(eq(cardHolds.authId, authId)).get();
+    if (existingHold) {
+      const response: LithicASAResponse = {
+        result: cardMode === "enforce" && existingHold.status === "reversed" ? "DECLINED" : "APPROVED",
+        token: lithicPayload.token
+      };
+      return reply.send(response);
+    }
+
+    // Load agent (create if doesn't exist in dev/shadow mode for testing)
+    let agent = db.select().from(agents).where(eq(agents.agentId, agentId)).get();
+    if (!agent) {
+      // In shadow/dev mode, approve but log the issue
+      // eslint-disable-next-line no-console
+      console.warn(`[lithic-asa] Agent not found: ${agentId}`);
+
+      const wouldDeclineReason = "agent_not_found";
+      const approved = cardMode !== "enforce";
+      const response: LithicASAResponse = {
+        result: approved ? "APPROVED" : "DECLINED",
+        token: lithicPayload.token
+      };
+
+      // Log even without agent for debugging
+      // eslint-disable-next-line no-console
+      console.log(`[lithic-asa] ${approved ? "APPROVED" : "DECLINED"} auth_id=${authId} would_decline_reason=${wouldDeclineReason} latency=${Date.now() - startTime}ms`);
+
+      return reply.send(response);
+    }
+
+    // Load or create spend snapshot
+    let snapshot =
+      (db
+        .select()
+        .from(agentSpendSnapshot)
+        .where(eq(agentSpendSnapshot.agentId, agentId))
+        .get() as typeof agentSpendSnapshot.$inferSelect | undefined) ??
+      refreshAgentSpendSnapshot({ db, sqlite, config, agentId });
+
+    // Load policy
+    const policyRow = db
+      .select()
+      .from(policies)
+      .where(and(eq(policies.agentId, agentId), eq(policies.userId, agent.userId)))
+      .orderBy(desc(policies.createdAt))
+      .get() as typeof policies.$inferSelect | undefined;
+    const policy = policyRow
+      ? { daily_limit: parseJson(policyRow.dailyLimitJson, {}) }
+      : { daily_limit: {} as { max_spend_cents?: number } };
+
+    const budget = db.select().from(budgets).where(eq(budgets.agentId, agentId)).get();
+    const dailyMax = policy.daily_limit.max_spend_cents ?? budget?.dailySpendCents ?? 0;
+    const dailyRemaining = Math.max(0, dailyMax - (budget?.dailySpendUsedCents ?? 0));
+
+    // Determine if we would approve
+    let wouldApprove = false;
+    let wouldDeclineReason: string | null = null;
+    if (!snapshot) {
+      wouldDeclineReason = "snapshot_missing";
+    } else if (amountCents > snapshot.policySpendableCents) {
+      wouldDeclineReason = "policy_limit_exceeded";
+    } else if (amountCents > snapshot.effectiveSpendPowerCents) {
+      wouldDeclineReason = "insufficient_spend_power";
+    } else {
+      wouldApprove = true;
+    }
+
+    const now = nowSeconds();
+    // In shadow mode: always approve but log would_decline
+    // In enforce mode: actually decline if policy says no
+    const approved = cardMode === "enforce" ? wouldApprove : true;
+    const shadow = cardMode !== "enforce";
+
+    const lithicResponse: LithicASAResponse = {
+      result: approved ? "APPROVED" : "DECLINED",
+      token: lithicPayload.token
+    };
+
+    const tx = sqlite.transaction(() => {
+      if (approved || cardMode !== "enforce") {
+        db.insert(cardHolds).values({
+          authId,
+          agentId,
+          amountCents,
+          status: approved ? "pending" : "reversed",
+          createdAt: now,
+          updatedAt: now
+        }).run();
+
+        if (snapshot && approved) {
+          const updatedReservedHolds = snapshot.reservedHoldsCents + amountCents;
+          const confirmedSpendableCents =
+            snapshot.confirmedBalanceCents -
+            snapshot.reservedOutgoingCents -
+            updatedReservedHolds -
+            config.USDC_BUFFER_CENTS;
+          const effectiveSpendPowerCents = Math.min(snapshot.policySpendableCents, confirmedSpendableCents);
+          db.update(agentSpendSnapshot)
+            .set({
+              reservedHoldsCents: updatedReservedHolds,
+              effectiveSpendPowerCents,
+              updatedAt: now
+            })
+            .where(eq(agentSpendSnapshot.agentId, agentId))
+            .run();
+        }
+      }
+
+      // Create event - note: we store original Lithic payload in metadata, not in kernel events
+      const event = appendEvent(db, sqlite, {
+        agentId,
+        userId: agent.userId,
+        type: "card_auth_shadow",
+        payload: {
+          // Canonical fields only - no Lithic payload shapes in kernel events
+          auth_id: authId,
+          card_id: cardId,
+          agent_id: agentId,
+          merchant: canonical.merchant,
+          mcc: canonical.mcc,
+          amount_cents: amountCents,
+          currency: canonical.currency,
+          timestamp: canonical.timestamp,
+          metadata: canonical.metadata, // Lithic-specific data isolated here
+          auth_status: authStatus,
+          shadow_mode: shadow,
+          would_approve: wouldApprove,
+          would_decline_reason: wouldDeclineReason,
+          spend_snapshot: snapshot ?? null,
+          policy_caps: { daily_limit_cents: dailyMax, daily_remaining_cents: dailyRemaining },
+          facts_snapshot: snapshot
+            ? {
+                policy_caps: { daily_limit_cents: dailyMax, daily_remaining_cents: dailyRemaining },
+                reserves: {
+                  reserved_outgoing_cents: snapshot.reservedOutgoingCents,
+                  reserved_holds_cents: snapshot.reservedHoldsCents
+                },
+                buffer_cents: config.USDC_BUFFER_CENTS,
+                confirmed_balance_cents: snapshot.confirmedBalanceCents
+              }
+            : null,
+          lithic_response: lithicResponse
+        }
+      });
+
+      createReceipt(db, {
+        agentId,
+        userId: agent.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: authId,
+        whatHappened: `Card auth ${shadow ? "observed in shadow mode" : approved ? "approved" : "declined"}.`,
+        whyChanged:
+          cardMode === "enforce"
+            ? approved
+              ? "card_auth_approved"
+              : "card_auth_declined"
+            : wouldApprove
+              ? "shadow_would_approve"
+              : "shadow_would_decline",
+        whatHappensNext: shadow
+          ? `Hold recorded; shadow decision logged.${wouldDeclineReason ? ` Would decline: ${wouldDeclineReason}` : ""}`
+          : approved
+            ? "Hold created; funds reserved."
+            : `Transaction declined: ${wouldDeclineReason}`
+      });
+    });
+    tx();
+
+    const latency = Date.now() - startTime;
+    // eslint-disable-next-line no-console
+    console.log(`[lithic-asa] ${lithicResponse.result} auth_id=${authId} amount=${amountCents} would_approve=${wouldApprove} latency=${latency}ms`);
+
+    if (latency > 2000) {
+      // eslint-disable-next-line no-console
+      console.warn(`[lithic-asa] SLOW RESPONSE: ${latency}ms (target <3s, timeout at 6s)`);
+    }
+
+    return reply.send(lithicResponse);
+  });
+
   app.post("/api/freeze", async (request, reply) => {
     const body = request.body as { agent_id: string; reason?: string };
     if (!body.agent_id) return reply.status(400).send({ error: "agent_id_required" });
@@ -1511,7 +2290,7 @@ export function buildServer(options: {
     return reply.send({ ok: true });
   });
 
-  return { app, kernel, env, db, sqlite, config };
+  return { app, kernel, env, db, sqlite, config, consoleDb, consoleSqlite };
 }
 
 export function buildApprovalServer(input: {
@@ -1624,8 +2403,9 @@ export function buildApprovalServer(input: {
       code: body.code,
       decision: body.decision
     });
-    if (!result.ok) {
-      return reply.status(400).send({ error: result.reason });
+    if (result.ok === false) {
+      const error = "reason" in result ? result.reason : "unknown_error";
+      return reply.status(400).send({ error });
     }
     return reply.send(result.response);
   });
@@ -1635,6 +2415,12 @@ export function buildApprovalServer(input: {
 
 async function main() {
   const { app, config, kernel, db } = buildServer();
+  if (process.env.NODE_ENV !== "test") {
+    // eslint-disable-next-line no-console
+    console.log(`DB_PATH=${config.DB_PATH}`);
+    // eslint-disable-next-line no-console
+    console.log(`CONSOLE_DB_PATH=${config.CONSOLE_DB_PATH}`);
+  }
   await app.listen({ port: config.PORT, host: "0.0.0.0" });
   if (config.BIND_APPROVAL_UI) {
     const approvalApp = buildApprovalServer({ config, kernel, db });

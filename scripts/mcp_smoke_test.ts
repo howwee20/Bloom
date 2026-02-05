@@ -10,8 +10,8 @@ if (!agentId) {
 
 async function main() {
   const transport = new StdioClientTransport({
-    command: "tsx",
-    args: ["src/mcp/server.ts"],
+    command: "node",
+    args: ["--no-warnings", "--loader", "tsx", "src/mcp/server.ts"],
     env: process.env
   });
 

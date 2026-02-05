@@ -21,6 +21,7 @@ export function createTestContext(overrides: Partial<Config> = {}) {
   const config: Config = {
     API_VERSION: overrides.API_VERSION ?? "0.1.0-alpha",
     DB_PATH: ":memory:",
+    CONSOLE_DB_PATH: ":memory:",
     PORT: 0,
     APPROVAL_UI_PORT: 0,
     BIND_APPROVAL_UI: false,
@@ -41,6 +42,9 @@ export function createTestContext(overrides: Partial<Config> = {}) {
     CONFIRMATIONS_REQUIRED: overrides.CONFIRMATIONS_REQUIRED ?? 5,
     USDC_BUFFER_CENTS: overrides.USDC_BUFFER_CENTS ?? 0,
     DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null,
+    LITHIC_API_KEY: overrides.LITHIC_API_KEY ?? null,
+    LITHIC_ASA_SECRET: overrides.LITHIC_ASA_SECRET ?? null,
+    LITHIC_API_URL: overrides.LITHIC_API_URL ?? "https://sandbox.lithic.com",
     ANTHROPIC_API_KEY: overrides.ANTHROPIC_API_KEY ?? null,
     ANTHROPIC_MODEL: overrides.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",
     CONSOLE_BOOTSTRAP_TOKEN: overrides.CONSOLE_BOOTSTRAP_TOKEN ?? null,

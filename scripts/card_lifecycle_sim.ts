@@ -42,7 +42,10 @@ function makeConfig(): Config {
     BASE_USDC_CONTRACT: null,
     CONFIRMATIONS_REQUIRED: 5,
     USDC_BUFFER_CENTS: 0,
-    DEV_MASTER_MNEMONIC: null
+    DEV_MASTER_MNEMONIC: null,
+    LITHIC_API_KEY: null,
+    LITHIC_ASA_SECRET: null,
+    LITHIC_API_URL: "https://sandbox.lithic.com"
   };
 }
 

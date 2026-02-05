@@ -757,6 +757,7 @@ export class Kernel {
       userId: input.user_id,
       source: "policy",
       eventId: event.event_id,
+      externalRef: quoteId,
       whatHappened: decision.allowed ? "Policy approved intent." : "Policy rejected intent.",
       whyChanged: decision.reason ?? "unknown",
       whatHappensNext: decision.allowed ? "Quote issued." : "No execution permitted."
@@ -1458,6 +1459,7 @@ export class Kernel {
 
     const { baseCost, transferAmount } = this.estimateIntentCost(intent);
     const execId = newId("exec");
+    const recordRef = quote.quoteId;
     let status: "applied" | "failed" = "applied";
     let externalRef = quote.quoteId;
 
@@ -1679,7 +1681,7 @@ export class Kernel {
         userId: quote.userId,
         source: "env",
         eventId: envEvent.event_id,
-        externalRef: externalRef,
+        externalRef: recordRef,
         whatHappened,
         whyChanged: envResult.ok ? "applied" : "failed",
         whatHappensNext: envResult.ok ? "Pending confirmation." : "Review transfer details."
@@ -1739,7 +1741,7 @@ export class Kernel {
           userId: quote.userId,
           source: "repair",
           eventId: repairEvent.event_id,
-          externalRef: externalRef,
+          externalRef: recordRef,
           whatHappened: "Budget adjusted after environment result.",
           whyChanged: "env_adjustment",
           whatHappensNext: "Credits updated."
@@ -1768,7 +1770,7 @@ export class Kernel {
           userId: quote.userId,
           source: "execution",
           eventId: deathEvent.event_id,
-          externalRef: externalRef,
+          externalRef: recordRef,
           whatHappened: "Agent marked dead.",
           whyChanged: "credits_depleted",
           whatHappensNext: "No further actions allowed."
@@ -1792,7 +1794,7 @@ export class Kernel {
         userId: quote.userId,
         source: "execution",
         eventId: finalEvent.event_id,
-        externalRef: externalRef,
+        externalRef: recordRef,
         whatHappened: status === "applied" ? "Execution applied." : "Execution failed.",
         whyChanged: status,
         whatHappensNext: status === "applied" ? "Observation will reflect changes." : "Review env receipts."

@@ -1,12 +1,17 @@
+const SESSION_KEY = "bloom_console_session_v1";
+
 const state = {
   session: null,
   messages: [],
   pendingQuotes: [],
   stepUp: null,
+  stepUpError: "",
   refreshTimer: null,
   refreshInFlight: false,
   isStreaming: false,
-  streamAbort: null
+  streamAbort: null,
+  lastActivity: [],
+  highlightRecordId: null
 };
 
 const elements = {
@@ -52,10 +57,44 @@ function formatMoney(cents) {
   return `${sign}$${(Math.abs(cents) / 100).toFixed(2)}`;
 }
 
+function shortenAddress(address, prefix = 6, suffix = 4) {
+  const trimmed = String(address ?? "").trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.length <= prefix + suffix + 1) return trimmed;
+  return `${trimmed.slice(0, prefix)}…${trimmed.slice(-suffix)}`;
+}
+
 function formatExpires(timestamp) {
   if (!timestamp) return "";
   const date = new Date(timestamp * 1000);
   return date.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+}
+
+function parseTransferCommand(text) {
+  const pattern = /\b(send|transfer)\b\s+\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:usdc|usd|dollars)?\s+to\s+(0x[0-9a-fA-F]+)/i;
+  const match = String(text ?? "").match(pattern);
+  if (!match) return null;
+  const amountCents = parseAmountToCents(match[2]);
+  if (!amountCents || amountCents <= 0) return null;
+  return {
+    amountCents,
+    toAddress: match[3]
+  };
+}
+
+function parseAmountToCents(value) {
+  const raw = String(value ?? "").trim().replace(/,/g, "");
+  if (!raw) return null;
+  const match = raw.match(/^(\d+)(\.(\d{1,2}))?$/);
+  if (!match) return null;
+  const dollars = Number(match[1]);
+  const cents = match[3] ? Number(match[3].padEnd(2, "0")) : 0;
+  if (!Number.isFinite(dollars) || !Number.isFinite(cents)) return null;
+  return dollars * 100 + cents;
+}
+
+function isTransferQuote(quote) {
+  return quote?.intent_type === "usdc_transfer" || quote?.action === "usdc_transfer";
 }
 
 function showError(message) {
@@ -103,10 +142,19 @@ function renderPendingQuotes() {
     card.className = `pending-card${quote.allowed ? "" : " pending-card--declined"}`;
 
     const title = document.createElement("h4");
-    title.textContent = quote.allowed ? "Approval required" : "Declined";
+    const isTransfer = isTransferQuote(quote);
+    if (isTransfer && Number.isFinite(quote.amount_cents)) {
+      title.textContent = `Send ${formatMoney(quote.amount_cents)}`;
+    } else {
+      title.textContent = quote.allowed ? "Approval required" : "Declined";
+    }
 
     const summary = document.createElement("p");
-    summary.textContent = quote.summary || quote.reason || "Quote created";
+    if (isTransfer && quote.to_address) {
+      summary.textContent = `to ${shortenAddress(quote.to_address)}`;
+    } else {
+      summary.textContent = quote.summary || quote.reason || "Quote created";
+    }
 
     card.appendChild(title);
     card.appendChild(summary);
@@ -128,11 +176,19 @@ function renderPendingQuotes() {
     if (quote.allowed) {
       const actionRow = document.createElement("div");
       actionRow.className = "pending-actions";
+
       const btn = document.createElement("button");
       btn.className = "btn btn--primary";
       btn.textContent = quote.requires_step_up ? "Approve (Step-Up)" : "Approve";
       btn.addEventListener("click", () => handleApproval(quote));
       actionRow.appendChild(btn);
+
+      const cancelBtn = document.createElement("button");
+      cancelBtn.className = "btn btn--ghost";
+      cancelBtn.textContent = "Cancel";
+      cancelBtn.addEventListener("click", () => cancelQuote(quote));
+      actionRow.appendChild(cancelBtn);
+
       card.appendChild(actionRow);
     }
 
@@ -142,6 +198,7 @@ function renderPendingQuotes() {
 
 function renderReceipts(activity) {
   elements.receiptsList.innerHTML = "";
+  state.lastActivity = activity || [];
   if (!activity || activity.length === 0) {
     const empty = document.createElement("p");
     empty.className = "hint";
@@ -222,7 +279,7 @@ async function refreshOverview() {
     elements.copyAddress.disabled = !walletAddress;
     elements.fundingHint.textContent = walletAddress
       ? "Add funds by sending USDC to this address."
-      : "This environment does not expose a wallet address.";
+      : "This environment does not expose an address.";
 
     if (state.session?.agent_id) {
       const expires = state.session.expires_at
@@ -364,9 +421,15 @@ async function handleChatSubmit(event) {
   if (!text || !state.session?.agent_id) return;
   if (state.isStreaming) return;
 
+  const transferCommand = parseTransferCommand(text);
   state.messages.push({ role: "user", content: text });
   elements.chatInput.value = "";
   renderMessages();
+
+  if (transferCommand) {
+    await handleTransferQuote(transferCommand);
+    return;
+  }
 
   try {
     await streamChat(state.messages);
@@ -389,9 +452,77 @@ async function handleChatSubmit(event) {
   }
 }
 
+async function handleTransferQuote(command) {
+  setStreaming(true);
+  try {
+    const response = await consoleFetch("/console/actions/transfer/quote", {
+      method: "POST",
+      body: JSON.stringify({
+        amount_cents: command.amountCents,
+        to_address: command.toAddress
+      })
+    });
+
+    const quote = {
+      ...response,
+      summary: response?.summary || response?.reason || "Quote created"
+    };
+    state.pendingQuotes = [...state.pendingQuotes, quote];
+
+    const toLabel = shortenAddress(quote.to_address ?? command.toAddress);
+    const assistantText = quote.allowed
+      ? `Review and approve the transfer to ${toLabel}.`
+      : response?.reason || "Transfer not approved by policy.";
+    state.messages.push({ role: "assistant", content: assistantText });
+
+    renderMessages();
+    renderPendingQuotes();
+    await refreshOverview();
+  } catch (err) {
+    state.messages.push({ role: "assistant", content: `Error: ${err.message}` });
+    renderMessages();
+  } finally {
+    setStreaming(false);
+  }
+}
+
+function finalizeTransferExecution(quote, result) {
+  const amountLabel = formatMoney(quote?.amount_cents ?? 0);
+  const toLabel = shortenAddress(quote?.to_address ?? "");
+  const txHash = result?.tx_hash;
+  const hashLabel = txHash ? shortenAddress(txHash, 10, 8) : "";
+  const message = txHash
+    ? `Sent ${amountLabel} to ${toLabel}. Tx ${hashLabel}.`
+    : `Sent ${amountLabel} to ${toLabel}.`;
+
+  state.messages.push({ role: "assistant", content: message });
+}
+
 async function handleApproval(quote) {
   if (!quote) return;
   try {
+    if (isTransferQuote(quote)) {
+      const result = await consoleFetch("/console/actions/transfer/approve", {
+        method: "POST",
+        body: JSON.stringify({ quote_id: quote.quote_id })
+      });
+      if (result?.status === "step_up_required") {
+        state.stepUp = {
+          flow: "transfer",
+          step_up_id: result.step_up_id,
+          quote_id: quote.quote_id,
+          code: result.code || ""
+        };
+        openStepUpModal(result.code);
+        return;
+      }
+      state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
+      finalizeTransferExecution(quote, result);
+      renderMessages();
+      renderPendingQuotes();
+      await refreshOverview();
+      return;
+    }
     if (quote.requires_step_up) {
       const stepUp = await consoleFetch("/console/step_up/request", {
         method: "POST",
@@ -421,6 +552,22 @@ async function executeQuote(quoteId, idempotencyKey, stepUpToken) {
   refreshOverview();
 }
 
+async function cancelQuote(quote) {
+  if (!quote) return;
+  if (isTransferQuote(quote)) {
+    try {
+      await consoleFetch("/console/actions/transfer/cancel", {
+        method: "POST",
+        body: JSON.stringify({ quote_id: quote.quote_id })
+      });
+    } catch (err) {
+      console.error(err);
+    }
+  }
+  state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
+  renderPendingQuotes();
+}
+
 function openStepUpModal(code) {
   if (!state.session?.agent_id) return;
   elements.stepUpCode.textContent = code || "—";
@@ -432,12 +579,32 @@ function closeStepUpModal() {
   elements.stepUpModal.hidden = true;
   elements.stepUpStatus.textContent = "";
   state.stepUp = null;
+  state.stepUpError = "";
 }
 
 async function confirmStepUp() {
   if (!state.stepUp) return;
   elements.stepUpStatus.textContent = "Approving...";
   try {
+    if (state.stepUp.flow === "transfer") {
+      const result = await consoleFetch("/console/actions/step_up/confirm", {
+        method: "POST",
+        body: JSON.stringify({
+          step_up_id: state.stepUp.step_up_id,
+          code: state.stepUp.code
+        })
+      });
+      const quote = state.pendingQuotes.find((item) => item.quote_id === state.stepUp.quote_id);
+      if (quote) {
+        state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
+        finalizeTransferExecution(quote, result);
+      }
+      closeStepUpModal();
+      renderMessages();
+      renderPendingQuotes();
+      await refreshOverview();
+      return;
+    }
     const result = await consoleFetch("/console/step_up/confirm", {
       method: "POST",
       body: JSON.stringify({

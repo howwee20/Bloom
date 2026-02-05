@@ -12,6 +12,7 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
   return {
     API_VERSION: "0.1.0-alpha",
     DB_PATH: ":memory:",
+    CONSOLE_DB_PATH: ":memory:",
     PORT: 0,
     APPROVAL_UI_PORT: 0,
     BIND_APPROVAL_UI: false,
@@ -32,6 +33,9 @@ function makeConfig(overrides: Partial<Config> = {}): Config {
     CONFIRMATIONS_REQUIRED: 5,
     USDC_BUFFER_CENTS: 0,
     DEV_MASTER_MNEMONIC: null,
+    LITHIC_API_KEY: null,
+    LITHIC_ASA_SECRET: null,
+    LITHIC_API_URL: "https://sandbox.lithic.com",
     ANTHROPIC_API_KEY: null,
     ANTHROPIC_MODEL: "claude-3-5-sonnet-20240620",
     CONSOLE_BOOTSTRAP_TOKEN: null,

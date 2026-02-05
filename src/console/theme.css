@@ -1,0 +1,16 @@
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Zen+Dots&display=swap");
+
+:root {
+  color-scheme: light;
+  --bg: #fff9f3;
+  --surface: rgba(255, 255, 255, 0.75);
+  --surface-strong: rgba(255, 255, 255, 0.95);
+  --text: #2a1c14;
+  --muted: rgba(76, 46, 28, 0.6);
+  --border: rgba(76, 46, 28, 0.18);
+  --shadow: 0 20px 50px rgba(160, 90, 40, 0.12);
+  --accent: #ff7a2f;
+  --accent-weak: #ffe4d2;
+  --success: #2b8a84;
+  --danger: #d95b4b;
+}

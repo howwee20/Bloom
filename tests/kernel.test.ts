@@ -28,6 +28,23 @@ describe("Constraint Kernel", () => {
     }).toThrow();
   });
 
+  it("enforces events append-only at the DB level", async () => {
+    const { sqlite, kernel } = createTestContext();
+    const { agent_id } = kernel.createAgent();
+    const row = sqlite
+      .prepare("SELECT event_id FROM events WHERE agent_id = ? ORDER BY rowid ASC LIMIT 1")
+      .get(agent_id) as { event_id?: string } | undefined;
+    expect(row?.event_id).toBeTruthy();
+    const eventId = row?.event_id ?? "";
+
+    expect(() => {
+      sqlite.prepare("UPDATE events SET type = ? WHERE event_id = ?").run("tamper", eventId);
+    }).toThrow();
+    expect(() => {
+      sqlite.prepare("DELETE FROM events WHERE event_id = ?").run(eventId);
+    }).toThrow();
+  });
+
   it("emits an event+receipt when creating an agent", async () => {
     const { sqlite, kernel } = createTestContext();
     const eventsBefore = sqlite.prepare("SELECT COUNT(1) as count FROM events").get() as { count: number };

@@ -258,7 +258,7 @@ input {
 }
 
 .message--streaming::after {
-  content: " ▍";
+  content: " \25CD";
   color: var(--accent);
   animation: blink 1s steps(2, start) infinite;
 }

@@ -3,6 +3,7 @@ import fs from "node:fs";
 export type Config = {
   API_VERSION: string;
   DB_PATH: string;
+  CONSOLE_DB_PATH: string;
   PORT: number;
   APPROVAL_UI_PORT: number;
   BIND_APPROVAL_UI: boolean;
@@ -23,6 +24,10 @@ export type Config = {
   CONFIRMATIONS_REQUIRED: number;
   USDC_BUFFER_CENTS: number;
   DEV_MASTER_MNEMONIC: string | null;
+  // Lithic integration
+  LITHIC_API_KEY: string | null;
+  LITHIC_ASA_SECRET: string | null;
+  LITHIC_API_URL: string;
   // Console (reference client)
   ANTHROPIC_API_KEY: string | null;
   ANTHROPIC_MODEL: string;
@@ -46,14 +51,39 @@ function isRunningInDocker() {
 export function getConfig(): Config {
   const env = process.env;
   const runningInDocker = isRunningInDocker();
-  const defaultDbPath = runningInDocker ? "/data/kernel.db" : "./data/kernel.db";
-  const dbPath = env.DB_PATH ?? defaultDbPath;
+  const allowNewKernel = env.ALLOW_NEW_KERNEL === "true" || env.CREATE_NEW_KERNEL === "true";
+  const fundedDbPath = "/Users/ejhowe/Bloom-clean/data/kernel.db";
+  const isMemoryPath = (value: string) => value === ":memory:" || value === "file::memory:";
+  let dbPath: string;
+
+  if (env.DB_PATH) {
+    dbPath = env.DB_PATH;
+  } else if (runningInDocker) {
+    dbPath = "/data/kernel.db";
+  } else if (fs.existsSync(fundedDbPath)) {
+    dbPath = fundedDbPath;
+  } else if (allowNewKernel) {
+    dbPath = "./data/kernel.db";
+  } else {
+    throw new Error(`Funded kernel DB not found at ${fundedDbPath}; set DB_PATH or create one.`);
+  }
+
   if (dbPath === "/data/kernel.db" && !runningInDocker) {
     throw new Error("DB_PATH=/data/kernel.db is reserved for Docker. Use ./data/kernel.db or set BLOOM_DOCKER=true.");
   }
+
+  if (!isMemoryPath(dbPath) && !fs.existsSync(dbPath) && !allowNewKernel) {
+    throw new Error(`Funded kernel DB not found at ${dbPath}; set DB_PATH or create one.`);
+  }
+
+  const defaultConsoleDbPath = runningInDocker ? "/data/console.db" : "./data/console.db";
+  const consoleDbPath =
+    env.CONSOLE_DB_PATH && env.CONSOLE_DB_PATH.trim().length > 0 ? env.CONSOLE_DB_PATH : defaultConsoleDbPath;
+
   return {
     API_VERSION: env.API_VERSION ?? "0.1.0-alpha",
     DB_PATH: dbPath,
+    CONSOLE_DB_PATH: consoleDbPath,
     PORT: env.PORT ? Number(env.PORT) : 3000,
     APPROVAL_UI_PORT: env.APPROVAL_UI_PORT ? Number(env.APPROVAL_UI_PORT) : 3001,
     BIND_APPROVAL_UI: env.BIND_APPROVAL_UI === "true",
@@ -76,6 +106,10 @@ export function getConfig(): Config {
     CONFIRMATIONS_REQUIRED: env.CONFIRMATIONS_REQUIRED ? Number(env.CONFIRMATIONS_REQUIRED) : 5,
     USDC_BUFFER_CENTS: env.USDC_BUFFER_CENTS ? Number(env.USDC_BUFFER_CENTS) : 0,
     DEV_MASTER_MNEMONIC: env.DEV_MASTER_MNEMONIC ?? null,
+    // Lithic integration
+    LITHIC_API_KEY: env.LITHIC_API_KEY ?? null,
+    LITHIC_ASA_SECRET: env.LITHIC_ASA_SECRET ?? null,
+    LITHIC_API_URL: env.LITHIC_API_URL ?? "https://sandbox.lithic.com",
     // Console (reference client)
     ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY ?? null,
     ANTHROPIC_MODEL: env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",

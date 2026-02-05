@@ -245,7 +245,7 @@ export function mapReceiptToHumanStep(receipt: ReceiptRow): HumanStep | null {
     };
   }
 
-  if (what.startsWith("USDC transfer confirmed on-chain.")) {
+  if (what.startsWith("USDC transfer confirmed on network.")) {
     return {
       kind: "confirmed",
       label: "Confirmed",
@@ -257,7 +257,7 @@ export function mapReceiptToHumanStep(receipt: ReceiptRow): HumanStep | null {
     };
   }
 
-  if (what.startsWith("USDC transfer reverted on-chain.")) {
+  if (what.startsWith("USDC transfer reverted on network.")) {
     return {
       kind: "declined",
       label: "Declined",
