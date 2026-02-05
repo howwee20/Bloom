@@ -30,7 +30,7 @@ body {
 }
 
 .arch-shell {
-  max-width: 1100px;
+  max-width: 1200px;
   margin: 0 auto;
   padding: 0 32px;
 }
@@ -51,11 +51,44 @@ body {
 }
 
 .arch-description {
-  margin: 0 0 28px;
-  max-width: 680px;
+  margin: 0;
   color: var(--muted);
-  font-size: 15px;
-  line-height: 1.6;
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.arch-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) minmax(0, 1fr);
+  gap: 32px;
+  align-items: stretch;
+  margin-top: 28px;
+}
+
+.arch-aside {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  justify-content: center;
+}
+
+.arch-step-card {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.25);
+  border-radius: 18px;
+  padding: 22px 20px;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.35);
+  min-height: 220px;
+}
+
+.arch-step-label {
+  font-size: 11px;
+  letter-spacing: 0.25em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.7);
+  margin-bottom: 12px;
 }
 
 .diagram {
@@ -254,11 +287,10 @@ body {
 }
 
 .stepper {
-  margin-top: 24px;
   display: flex;
   align-items: center;
-  justify-content: center;
-  gap: 18px;
+  justify-content: flex-start;
+  gap: 12px;
 }
 
 .stepper-btn {
@@ -292,6 +324,14 @@ body {
 @media (max-width: 900px) {
   .arch-shell {
     padding: 0 24px;
+  }
+
+  .arch-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .arch-aside {
+    padding-top: 0;
   }
 
   .diagram {
