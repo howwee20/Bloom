@@ -104,6 +104,40 @@ function formatMoney(cents) {
   return `${sign}$${(Math.abs(cents) / 100).toFixed(2)}`;
 }
 
+function shortenAddress(address, prefix = 6, suffix = 4) {
+  const trimmed = String(address ?? "").trim();
+  if (!trimmed) return trimmed;
+  if (trimmed.length <= prefix + suffix + 1) return trimmed;
+  return `${trimmed.slice(0, prefix)}…${trimmed.slice(-suffix)}`;
+}
+
+function parseAmountToCents(value) {
+  const raw = String(value ?? "").trim().replace(/,/g, "");
+  if (!raw) return null;
+  const match = raw.match(/^(\d+)(\.(\d{1,2}))?$/);
+  if (!match) return null;
+  const dollars = Number(match[1]);
+  const cents = match[3] ? Number(match[3].padEnd(2, "0")) : 0;
+  if (!Number.isFinite(dollars) || !Number.isFinite(cents)) return null;
+  return dollars * 100 + cents;
+}
+
+function parseTransferCommand(text) {
+  const pattern = /\b(send|transfer)\b\s+\$?\s*([0-9]+(?:\.[0-9]{1,2})?)\s*(?:usdc|usd|dollars)?\s+to\s+(0x[0-9a-fA-F]+)/i;
+  const match = String(text ?? "").match(pattern);
+  if (!match) return null;
+  const amountCents = parseAmountToCents(match[2]);
+  if (!amountCents || amountCents <= 0) return null;
+  return {
+    amountCents,
+    toAddress: match[3]
+  };
+}
+
+function isTransferQuote(quote) {
+  return quote?.intent_type === "usdc_transfer" || quote?.action === "usdc_transfer";
+}
+
 function setError(message) {
   elements.sessionError.textContent = message ? mapErrorMessage(message) : "";
 }
@@ -139,6 +173,36 @@ function mapErrorMessage(message) {
   if (text === "no_agents_found") {
     return "No existing Bloom found in this database.";
   }
+  if (text === "console_session_required") {
+    return "Session expired. Please reconnect.";
+  }
+  if (text === "invalid_to_address") {
+    return "That address doesn't look right. Please double-check it.";
+  }
+  if (text === "invalid_amount_cents") {
+    return "Enter a valid dollar amount.";
+  }
+  if (text === "quote_expired") {
+    return "That quote expired. Ask again to get a fresh one.";
+  }
+  if (text === "quote_not_allowed") {
+    return "That transfer isn't approved by policy.";
+  }
+  if (text === "quote_cancelled") {
+    return "That quote was cancelled.";
+  }
+  if (text === "insufficient_confirmed_usdc" || text === "insufficient_credits") {
+    return "Insufficient available balance.";
+  }
+  if (text === "insufficient_gas") {
+    return "Not enough balance to cover the network fee.";
+  }
+  if (text === "rate_limited") {
+    return "Too many requests. Try again in a moment.";
+  }
+  if (text === "step_up_failed" || text === "challenge_expired" || text === "challenge_not_found") {
+    return "Step-up failed. Please try again.";
+  }
   if (!text) return "Something went wrong.";
   if (text.length > 140) return "Something went wrong. Please try again.";
   return text;
@@ -165,7 +229,7 @@ function renderMessages() {
       link.type = "button";
       link.className = "message__link";
       link.textContent = "View record";
-      link.addEventListener("click", () => openRecordHighlight());
+      link.addEventListener("click", () => openRecordHighlight(msg.recordId));
       bubble.appendChild(link);
     }
     elements.chatMessages.appendChild(bubble);
@@ -194,9 +258,11 @@ function shouldShowRecordLink(text) {
   );
 }
 
-function openRecordHighlight() {
+function openRecordHighlight(recordId) {
   const latest = state.lastActivity?.[0];
-  if (latest?.id) {
+  if (recordId) {
+    state.highlightRecordId = recordId;
+  } else if (latest?.id) {
     state.highlightRecordId = latest.id;
   } else {
     state.highlightRecordId = null;
@@ -212,11 +278,20 @@ function renderPendingQuotes() {
 
     const title = document.createElement("div");
     title.className = "action-title";
-    title.textContent = quote.allowed ? "Approval needed" : "Not approved";
+    const isTransfer = isTransferQuote(quote);
+    if (isTransfer && Number.isFinite(quote.amount_cents)) {
+      title.textContent = `Send ${formatMoney(quote.amount_cents)}`;
+    } else {
+      title.textContent = quote.allowed ? "Approval needed" : "Not approved";
+    }
 
     const summary = document.createElement("div");
     summary.className = "action-summary";
-    summary.textContent = quote.summary || quote.reason || "Quote created";
+    if (isTransfer && quote.to_address) {
+      summary.textContent = `to ${shortenAddress(quote.to_address)}`;
+    } else {
+      summary.textContent = quote.summary || quote.reason || "Quote created";
+    }
 
     card.appendChild(title);
     card.appendChild(summary);
@@ -235,7 +310,7 @@ function renderPendingQuotes() {
       cancel.className = "btn btn--ghost";
       cancel.type = "button";
       cancel.textContent = "Cancel";
-      cancel.addEventListener("click", () => cancelQuote(quote.quote_id));
+      cancel.addEventListener("click", () => cancelQuote(quote));
 
       actions.appendChild(approve);
       actions.appendChild(cancel);
@@ -448,10 +523,16 @@ async function handleChatSubmit(event) {
   const text = elements.chatInput.value.trim();
   if (!text) return;
 
+  const transferCommand = parseTransferCommand(text);
   state.messages.push({ role: "user", content: text });
   elements.chatInput.value = "";
   autoResize();
   renderMessages();
+  if (transferCommand) {
+    await handleTransferQuote(transferCommand);
+    return;
+  }
+
   setStreaming(true);
 
   state.abortController = new AbortController();
@@ -493,16 +574,90 @@ async function handleChatSubmit(event) {
   }
 }
 
+async function handleTransferQuote(command) {
+  setStreaming(true);
+  try {
+    const response = await apiFetch("/console/actions/transfer/quote", {
+      method: "POST",
+      body: JSON.stringify({
+        amount_cents: command.amountCents,
+        to_address: command.toAddress
+      })
+    });
+
+    const quote = {
+      ...response,
+      summary: response?.summary || response?.reason || "Quote created"
+    };
+    state.pendingQuotes = [...state.pendingQuotes, quote];
+
+    const amountLabel = formatMoney(quote.amount_cents ?? command.amountCents);
+    const toLabel = shortenAddress(quote.to_address ?? command.toAddress);
+    const assistantText = quote.allowed
+      ? `Review and approve the transfer to ${toLabel}.`
+      : mapErrorMessage(quote.reason || "quote_not_allowed");
+    state.messages.push({ role: "assistant", content: assistantText });
+
+    renderMessages();
+    await refreshOverview();
+  } catch (err) {
+    state.messages.push({ role: "assistant", content: mapErrorMessage(err.message) });
+    renderMessages();
+  } finally {
+    setStreaming(false);
+  }
+}
+
+function finalizeTransferExecution(quote, result) {
+  const amountLabel = formatMoney(quote?.amount_cents ?? 0);
+  const toLabel = shortenAddress(quote?.to_address ?? "");
+  const txHash = result?.tx_hash;
+  const hashLabel = txHash ? shortenAddress(txHash, 10, 8) : "";
+  const message = txHash
+    ? `Sent ${amountLabel} to ${toLabel}. Tx ${hashLabel}.`
+    : `Sent ${amountLabel} to ${toLabel}.`;
+
+  state.messages.push({
+    role: "assistant",
+    content: message,
+    showRecordLink: true,
+    recordId: result?.record_id || txHash
+  });
+}
+
 async function handleApproval(quote) {
   if (!quote) return;
   setAdvancedError("");
   try {
+    if (isTransferQuote(quote)) {
+      const result = await apiFetch("/console/actions/transfer/approve", {
+        method: "POST",
+        body: JSON.stringify({ quote_id: quote.quote_id })
+      });
+      if (result?.status === "step_up_required") {
+        state.stepUp = {
+          flow: "transfer",
+          step_up_id: result.step_up_id,
+          quote_id: quote.quote_id,
+          code: result.code || ""
+        };
+        state.stepUpError = "";
+        renderMessages();
+        return;
+      }
+      state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
+      finalizeTransferExecution(quote, result);
+      renderMessages();
+      await refreshOverview();
+      return;
+    }
     if (quote.requires_step_up) {
       const stepUp = await apiFetch("/console/step_up/request", {
         method: "POST",
         body: JSON.stringify({ agent_id: state.session.agent_id, quote_id: quote.quote_id })
       });
       state.stepUp = {
+        flow: "quote",
         challenge_id: stepUp.challenge_id,
         quote_id: quote.quote_id,
         idempotency_key: quote.idempotency_key,
@@ -514,7 +669,12 @@ async function handleApproval(quote) {
     }
     await executeQuote(quote.quote_id, quote.idempotency_key);
   } catch (err) {
-    state.stepUpError = mapErrorMessage(err.message);
+    const message = mapErrorMessage(err.message);
+    if (state.stepUp) {
+      state.stepUpError = message;
+    } else {
+      state.messages.push({ role: "assistant", content: message });
+    }
     renderMessages();
   }
 }
@@ -535,8 +695,19 @@ async function executeQuote(quoteId, idempotencyKey, stepUpToken) {
   await refreshOverview();
 }
 
-function cancelQuote(quoteId) {
-  state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quoteId);
+async function cancelQuote(quote) {
+  if (!quote) return;
+  if (isTransferQuote(quote)) {
+    try {
+      await apiFetch("/console/actions/transfer/cancel", {
+        method: "POST",
+        body: JSON.stringify({ quote_id: quote.quote_id })
+      });
+    } catch (err) {
+      state.messages.push({ role: "assistant", content: mapErrorMessage(err.message) });
+    }
+  }
+  state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
   renderMessages();
 }
 
@@ -547,6 +718,25 @@ async function confirmStepUp(code) {
     return;
   }
   try {
+    if (state.stepUp.flow === "transfer") {
+      const result = await apiFetch("/console/actions/step_up/confirm", {
+        method: "POST",
+        body: JSON.stringify({
+          step_up_id: state.stepUp.step_up_id,
+          code
+        })
+      });
+      const quote = state.pendingQuotes.find((item) => item.quote_id === state.stepUp.quote_id);
+      if (quote) {
+        state.pendingQuotes = state.pendingQuotes.filter((item) => item.quote_id !== quote.quote_id);
+        finalizeTransferExecution(quote, result);
+      }
+      state.stepUp = null;
+      state.stepUpError = "";
+      renderMessages();
+      await refreshOverview();
+      return;
+    }
     const result = await apiFetch("/console/step_up/confirm", {
       method: "POST",
       body: JSON.stringify({
