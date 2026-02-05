@@ -3,3 +3,7 @@ dist
 data
 .env
 *.db
+.vercel
+.env*.local
+lithic-simulation-results.json
+__pycache__/

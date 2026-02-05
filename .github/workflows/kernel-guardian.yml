@@ -1,0 +1,29 @@
+name: kernel-guardian
+
+on:
+  pull_request:
+    paths:
+      - "kernel.ts"
+      - "src/kernel.ts"
+      - "migrations/**"
+      - "db/migrations/**"
+      - "src/db/migrations/**"
+      - "events.ts"
+      - "receipts.ts"
+      - "server.ts"
+      - "src/**"
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  guardian:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Run Bloom Kernel Guardian
+        run: python skills/bloom-kernel-guardian/scripts/guardian.py
+      - name: Run Bloom Semantics Linter
+        run: python skills/bloom-semantics/scripts/semantics_lint.py
