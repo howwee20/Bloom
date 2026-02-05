@@ -44,7 +44,12 @@ export function createTestContext(overrides: Partial<Config> = {}) {
     DEV_MASTER_MNEMONIC: overrides.DEV_MASTER_MNEMONIC ?? null,
     LITHIC_API_KEY: overrides.LITHIC_API_KEY ?? null,
     LITHIC_ASA_SECRET: overrides.LITHIC_ASA_SECRET ?? null,
-    LITHIC_API_URL: overrides.LITHIC_API_URL ?? "https://sandbox.lithic.com"
+    LITHIC_API_URL: overrides.LITHIC_API_URL ?? "https://sandbox.lithic.com",
+    ANTHROPIC_API_KEY: overrides.ANTHROPIC_API_KEY ?? null,
+    ANTHROPIC_MODEL: overrides.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",
+    CONSOLE_BOOTSTRAP_TOKEN: overrides.CONSOLE_BOOTSTRAP_TOKEN ?? null,
+    CONSOLE_PASSWORD: overrides.CONSOLE_PASSWORD ?? null,
+    CONSOLE_SESSION_TTL_SECONDS: overrides.CONSOLE_SESSION_TTL_SECONDS ?? 12 * 60 * 60
   };
   const env = new SimpleEconomyWorld(db, sqlite, config);
   const kernel = new Kernel(db, sqlite, env, config);

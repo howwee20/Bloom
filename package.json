@@ -17,6 +17,7 @@
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/api/server.ts",
     "migrate": "tsx src/db/migrate.ts",
+    "console:dev": "tsx scripts/console_dev.ts",
     "console:first-run": "tsx scripts/console_first_run.ts",
     "test": "vitest run",
     "replay": "tsx src/workers/replay.ts",

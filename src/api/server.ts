@@ -19,6 +19,8 @@ import {
   apiKeys,
   budgets,
   cardHolds,
+  consoleSessions,
+  consoleState,
   events,
   policies,
   quotes,
@@ -206,29 +208,11 @@ type AnthropicMessage = {
   content: string | AnthropicContentBlock[] | unknown[];
 };
 
+const CONSOLE_COOKIE_NAME = "bloom_console_session";
+
 function isLoopback(ip: string | undefined) {
   if (!ip) return false;
   return ip === "127.0.0.1" || ip === "::1" || ip.startsWith("::ffff:127.");
-}
-
-function allowConsoleBootstrap(
-  config: ReturnType<typeof getConfig>,
-  request: FastifyRequest,
-  reply: FastifyReply,
-  token?: string
-) {
-  if (config.CONSOLE_BOOTSTRAP_TOKEN) {
-    if (token !== config.CONSOLE_BOOTSTRAP_TOKEN) {
-      reply.status(403).send({ error: "bootstrap_token_required" });
-      return false;
-    }
-    return true;
-  }
-  if (!isLoopback(request.ip)) {
-    reply.status(403).send({ error: "bootstrap_locked" });
-    return false;
-  }
-  return true;
 }
 
 function resolveConsoleAsset(assetName: string) {
@@ -237,6 +221,38 @@ function resolveConsoleAsset(assetName: string) {
     if (fs.existsSync(candidate)) return candidate;
   }
   return null;
+}
+
+function setNoCache(reply: FastifyReply) {
+  reply.header("cache-control", "no-store, max-age=0");
+  reply.header("pragma", "no-cache");
+  reply.header("expires", "0");
+}
+
+function parseCookies(header: string | undefined) {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  header.split(";").forEach((part) => {
+    const [rawKey, ...rest] = part.trim().split("=");
+    if (!rawKey) return;
+    out[rawKey] = rest.join("=") ?? "";
+  });
+  return out;
+}
+
+function setConsoleCookie(reply: FastifyReply, value: string, maxAgeSeconds: number) {
+  const parts = [
+    `${CONSOLE_COOKIE_NAME}=${value}`,
+    "Path=/",
+    "HttpOnly",
+    "SameSite=Strict",
+    `Max-Age=${maxAgeSeconds}`
+  ];
+  reply.header("set-cookie", parts.join("; "));
+}
+
+function clearConsoleCookie(reply: FastifyReply) {
+  reply.header("set-cookie", `${CONSOLE_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
 }
 
 async function callAnthropic(options: {
@@ -273,7 +289,7 @@ async function callAnthropic(options: {
 
 function buildConsoleSystemPrompt(agentId: string) {
   return [
-    "You are Bloom, a money assistant.",
+    "You are Bloom Console, the reference client for the Bloom Kernel.",
     "You can read state and propose intents, but you must never execute actions.",
     "Always call tools to answer balance questions. Never guess.",
     "When a user asks to move money, propose a quote via kernel_can_do and ask for approval.",
@@ -300,12 +316,6 @@ function summarizeIntent(intent: Record<string, unknown>) {
     return `Send ${amountLabel} to ${toLabel}`;
   }
   return `Intent: ${type || "unknown"}`;
-}
-
-function requireConsoleSession(request: FastifyRequest, reply: FastifyReply) {
-  if (request.consoleSession) return true;
-  reply.status(401).send({ error: "console_session_required" });
-  return false;
 }
 
 function parseAmountCents(value: unknown) {
@@ -486,6 +496,7 @@ export function buildServer(options: {
   const TRANSFER_QUOTE_RATE_MAX = 12;
   const TRANSFER_APPROVE_RATE_MAX = 6;
   const TRANSFER_STEP_UP_RATE_MAX = 6;
+  const consoleStateId = "default";
 
   app.get("/healthz", { config: { auth: "public" } }, async (_request, reply) => {
     let dbConnected = false;
@@ -543,6 +554,51 @@ export function buildServer(options: {
     if (dedup?.txHash) return dedup.txHash;
     if (looksLikeTxHash(input.fallback)) return input.fallback as string;
     return null;
+  }
+
+  function getConsoleState() {
+    return db.select().from(consoleState).where(eq(consoleState.id, consoleStateId)).get() as
+      | typeof consoleState.$inferSelect
+      | undefined;
+  }
+
+  function createConsoleSession(input: { userId: string; agentId: string }) {
+    const now = nowSeconds();
+    const sessionId = newId("console_session");
+    const expiresAt = now + Math.max(300, config.CONSOLE_SESSION_TTL_SECONDS);
+    db.insert(consoleSessions).values({
+      sessionId,
+      userId: input.userId,
+      agentId: input.agentId,
+      createdAt: now,
+      expiresAt
+    }).run();
+    return { sessionId, expiresAt };
+  }
+
+  function requireConsoleSession(request: FastifyRequest, reply: FastifyReply) {
+    const cookies = parseCookies(request.headers.cookie);
+    const sessionId = cookies[CONSOLE_COOKIE_NAME];
+    if (!sessionId) {
+      reply.status(401).send({ error: "console_session_required" });
+      return null;
+    }
+    const session = db.select().from(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).get() as
+      | typeof consoleSessions.$inferSelect
+      | undefined;
+    if (!session) {
+      clearConsoleCookie(reply);
+      reply.status(401).send({ error: "console_session_invalid" });
+      return null;
+    }
+    const now = nowSeconds();
+    if (session.expiresAt <= now) {
+      db.delete(consoleSessions).where(eq(consoleSessions.sessionId, sessionId)).run();
+      clearConsoleCookie(reply);
+      reply.status(401).send({ error: "console_session_expired" });
+      return null;
+    }
+    return session;
   }
 
   app.addHook("preHandler", async (request, reply) => {
@@ -773,11 +829,48 @@ export function buildServer(options: {
     return reply.send(result);
   });
 
+  const handleConsoleLogin = async (request: FastifyRequest, reply: FastifyReply) => {
+    const body = (request.body ?? {}) as { password?: string; bootstrap_token?: string };
+    if (config.CONSOLE_PASSWORD) {
+      if (body.password !== config.CONSOLE_PASSWORD) {
+        return reply.status(403).send({ error: "console_password_required" });
+      }
+    } else if (!isLoopback(request.ip)) {
+      return reply.status(403).send({ error: "console_login_locked" });
+    }
+
+    let state = getConsoleState();
+    if (!state) {
+      if (config.CONSOLE_BOOTSTRAP_TOKEN) {
+        if (body.bootstrap_token !== config.CONSOLE_BOOTSTRAP_TOKEN) {
+          return reply.status(403).send({ error: "bootstrap_token_required" });
+        }
+      } else if (!isLoopback(request.ip)) {
+        return reply.status(403).send({ error: "bootstrap_locked" });
+      }
+
+      const created = kernel.createAgent();
+      const now = nowSeconds();
+      db.insert(consoleState).values({
+        id: consoleStateId,
+        userId: created.user_id,
+        agentId: created.agent_id,
+        createdAt: now
+      }).run();
+      state = { id: consoleStateId, userId: created.user_id, agentId: created.agent_id, createdAt: now };
+    }
+
+    const session = createConsoleSession({ userId: state.userId, agentId: state.agentId });
+    setConsoleCookie(reply, session.sessionId, config.CONSOLE_SESSION_TTL_SECONDS);
+    return reply.send({ user_id: state.userId, agent_id: state.agentId, expires_at: session.expiresAt });
+  };
+
   // Bloom Console (reference client)
   app.get("/console", { config: { auth: "public" } }, async (_request, reply) => {
     const assetPath = resolveConsoleAsset("index.html");
     if (!assetPath) return reply.status(404).send("Console not found");
     const html = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/html").send(html);
   });
 
@@ -785,6 +878,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("app.js");
     if (!assetPath) return reply.status(404).send("Not found");
     const js = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/javascript").send(js);
   });
 
@@ -792,6 +886,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("styles.css");
     if (!assetPath) return reply.status(404).send("Not found");
     const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/css").send(css);
   });
 
@@ -799,6 +894,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("theme.css");
     if (!assetPath) return reply.status(404).send("Not found");
     const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/css").send(css);
   });
 
@@ -806,6 +902,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("architecture.html");
     if (!assetPath) return reply.status(404).send("Not found");
     const html = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/html").send(html);
   });
 
@@ -813,6 +910,7 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("architecture.css");
     if (!assetPath) return reply.status(404).send("Not found");
     const css = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/css").send(css);
   });
 
@@ -820,124 +918,56 @@ export function buildServer(options: {
     const assetPath = resolveConsoleAsset("architecture.js");
     if (!assetPath) return reply.status(404).send("Not found");
     const js = fs.readFileSync(assetPath, "utf8");
+    setNoCache(reply);
     return reply.type("text/javascript").send(js);
   });
 
-  app.post("/console/bootstrap", { config: { auth: "public" } }, async (request, reply) => {
-    const body = (request.body ?? {}) as { bootstrap_token?: string; confirm_text?: string };
-    if (!allowConsoleBootstrap(config, request, reply, body.bootstrap_token)) return;
-    if (body.confirm_text !== "CREATE") {
-      return reply.status(400).send({ error: "confirm_required" });
-    }
+  app.post("/console/login", { config: { auth: "public" } }, handleConsoleLogin);
+  app.post("/console/bootstrap", { config: { auth: "public" } }, handleConsoleLogin);
 
-    const created = kernel.createAgent();
-    const apiKey = generateApiKey();
-    const keyHash = hashApiKey(apiKey);
-    const keyId = newId("key");
-    db.insert(apiKeys).values({
-      keyId,
-      userId: created.user_id,
-      keyHash,
-      scopesJson: ["*"],
-      status: "active",
-      createdAt: nowSeconds()
-    }).run();
-
-    const sessionId = createConsoleSessionRow({
-      consoleDb,
-      userId: created.user_id,
-      agentId: created.agent_id,
-      apiKey
-    });
-    return reply.send({ user_id: created.user_id, agent_id: created.agent_id, session_id: sessionId });
+  app.post("/console/logout", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    db.delete(consoleSessions).where(eq(consoleSessions.sessionId, session.sessionId)).run();
+    clearConsoleCookie(reply);
+    return reply.send({ ok: true });
   });
 
-  app.post("/console/login", { config: { auth: "public" } }, async (request, reply) => {
-    const body = (request.body ?? {}) as { bootstrap_token?: string };
-    if (!allowConsoleBootstrap(config, request, reply, body.bootstrap_token)) return;
-
-    const agent = selectDefaultAgent(db);
-    if (!agent) return reply.status(404).send({ error: "no_agents_found" });
-
-    const apiKey = generateApiKey();
-    const keyHash = hashApiKey(apiKey);
-    const keyId = newId("key");
-    db.insert(apiKeys).values({
-      keyId,
-      userId: agent.userId,
-      keyHash,
-      scopesJson: ["*"],
-      status: "active",
-      createdAt: nowSeconds()
-    }).run();
-
-    const sessionId = createConsoleSessionRow({
-      consoleDb,
-      userId: agent.userId,
-      agentId: agent.agentId,
-      apiKey
+  app.get("/console/session", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    return reply.send({
+      user_id: session.userId,
+      agent_id: session.agentId,
+      expires_at: session.expiresAt
     });
-    return reply.send({ user_id: agent.userId, agent_id: agent.agentId, session_id: sessionId });
   });
 
-  app.post("/console/import", { config: { auth: "public" } }, async (request, reply) => {
-    const body = (request.body ?? {}) as { api_key?: string; agent_id?: string; bootstrap_token?: string };
-    if (!allowConsoleBootstrap(config, request, reply, body.bootstrap_token)) return;
-    if (!body.api_key || !body.agent_id) {
-      return reply.status(400).send({ error: "api_key_and_agent_id_required" });
-    }
-
-    const keyHash = hashApiKey(body.api_key);
-    const keyRow = db.select().from(apiKeys).where(eq(apiKeys.keyHash, keyHash)).get();
-    if (!keyRow || keyRow.status !== "active") {
-      return reply.status(401).send({ error: "invalid_api_key" });
-    }
-
-    const ownership = ensureAgentOwnership(db, body.agent_id, keyRow.userId);
-    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
-
-    const sessionId = createConsoleSessionRow({
-      consoleDb,
-      userId: keyRow.userId,
-      agentId: body.agent_id,
-      apiKey: body.api_key
-    });
-    return reply.send({ user_id: keyRow.userId, agent_id: body.agent_id, session_id: sessionId });
-  });
-
-  app.get("/console/overview", { config: { auth: "console" } }, async (request, reply) => {
-    const query = request.query as { agent_id?: string };
-    if (!query.agent_id) return reply.status(400).send({ error: "agent_id_required" });
-    if (!requireScope(request, reply, "read")) return;
-    if (!ensureConsoleAgentMatch(request, reply, query.agent_id)) return;
-    const authUser = request.authUser as AuthUser;
-    const ownership = ensureAgentOwnership(db, query.agent_id, authUser.userId);
-    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
-    const state = await kernel.getState(query.agent_id);
-    const receiptRows = kernel.getReceipts(query.agent_id);
+  app.get("/console/overview", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const state = await kernel.getState(session.agentId);
+    const receiptRows = kernel.getReceipts(session.agentId);
     const activity = buildUiActivity(receiptRows, { limit: 12 });
     return reply.send({ state, activity, updated_at: nowSeconds() });
   });
 
-  app.post("/console/chat", { config: { auth: "console" } }, async (request, reply) => {
-    const body = (request.body ?? {}) as { agent_id?: string; messages?: ConsoleChatMessage[] };
-    if (!body.agent_id) return reply.status(400).send({ error: "agent_id_required" });
-    if (!requireScope(request, reply, "propose")) return;
-    if (!ensureConsoleAgentMatch(request, reply, body.agent_id)) return;
-    const authUser = request.authUser as AuthUser;
-    const ownership = ensureAgentOwnership(db, body.agent_id, authUser.userId);
-    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+  app.post("/console/chat", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     if (!config.ANTHROPIC_API_KEY) return reply.status(400).send({ error: "anthropic_api_key_missing" });
 
+    const body = (request.body ?? {}) as { messages?: ConsoleChatMessage[]; stream?: boolean };
     const rawMessages = Array.isArray(body.messages) ? body.messages : [];
     const messages = rawMessages
       .filter((msg) => msg && (msg.role === "user" || msg.role === "assistant"))
       .slice(-12);
-    const system = buildConsoleSystemPrompt(body.agent_id);
+
+    const system = buildConsoleSystemPrompt(session.agentId);
     const tools = [
       {
         name: "kernel_state",
-        description: "Get current spend power and address state for the agent.",
+        description: "Get current spend power and account state for the agent.",
         input_schema: { type: "object", properties: {} }
       },
       {
@@ -951,7 +981,11 @@ export function buildServer(options: {
         input_schema: {
           type: "object",
           properties: {
-            intent: { type: "object", description: "Intent JSON. Example: {\"type\":\"usdc_transfer\",\"amount_cents\":500,\"to_address\":\"0x...\"}" }
+            intent: {
+              type: "object",
+              description:
+                "Intent JSON. Example: {\"type\":\"usdc_transfer\",\"amount_cents\":500,\"to_address\":\"0x...\"}"
+            }
           },
           required: ["intent"]
         }
@@ -972,18 +1006,18 @@ export function buildServer(options: {
     }> = [];
 
     const toolHandlers = {
-      kernel_state: async () => await kernel.getState(body.agent_id as string),
+      kernel_state: async () => await kernel.getState(session.agentId),
       kernel_receipts: async (input: Record<string, unknown>) => {
         const limit = Number(input.limit ?? 6);
-        const rows = kernel.getReceipts(body.agent_id as string);
+        const rows = kernel.getReceipts(session.agentId);
         return buildUiActivity(rows, { limit: Number.isFinite(limit) ? limit : 6 });
       },
       kernel_can_do: async (input: Record<string, unknown>) => {
         const intent = (input.intent ?? {}) as Record<string, unknown>;
         const idempotencyKey = newId("idem");
         const quote = await kernel.canDo({
-          user_id: authUser.userId,
-          agent_id: body.agent_id as string,
+          user_id: session.userId,
+          agent_id: session.agentId,
           intent_json: intent,
           idempotency_key: idempotencyKey
         });
@@ -1015,83 +1049,118 @@ export function buildServer(options: {
       content: msg.content
     }));
 
-    let assistantText = "";
-    let nextMessages: AnthropicMessage[] = [...anthropicMessages];
+    const wantsStream = body.stream === true || String(request.headers.accept ?? "").includes("text/event-stream");
 
-    for (let step = 0; step < 2; step += 1) {
-      const response = await callAnthropic({
-        apiKey: config.ANTHROPIC_API_KEY,
-        model: config.ANTHROPIC_MODEL,
-        system,
-        messages: nextMessages,
-        tools
-      });
+    const runChat = async () => {
+      let assistantText = "";
+      let nextMessages: AnthropicMessage[] = [...anthropicMessages];
 
-      const toolUses = response.content.filter((block) => block.type === "tool_use");
-      const textBlocks = response.content.filter((block) => block.type === "text");
-      if (!toolUses.length) {
-        assistantText = textBlocks.map((block) => block.text).join("");
-        break;
-      }
+      for (let step = 0; step < 2; step += 1) {
+        const response = await callAnthropic({
+          apiKey: config.ANTHROPIC_API_KEY as string,
+          model: config.ANTHROPIC_MODEL,
+          system,
+          messages: nextMessages,
+          tools
+        });
 
-      nextMessages = [...nextMessages, { role: "assistant", content: response.content }];
+        const toolUses = response.content.filter((block) => block.type === "tool_use");
+        const textBlocks = response.content.filter((block) => block.type === "text");
+        if (!toolUses.length) {
+          assistantText = textBlocks.map((block) => block.text).join("");
+          break;
+        }
 
-      const toolResults = [];
-      for (const toolUse of toolUses) {
-        const handler = toolHandlers[toolUse.name as keyof typeof toolHandlers];
-        if (!handler) {
+        nextMessages = [...nextMessages, { role: "assistant", content: response.content }];
+
+        const toolResults = [];
+        for (const toolUse of toolUses) {
+          const handler = toolHandlers[toolUse.name as keyof typeof toolHandlers];
+          if (!handler) {
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: toolUse.id,
+              content: JSON.stringify({ error: "unknown_tool" })
+            });
+            continue;
+          }
+          const result = await handler(toolUse.input ?? {});
           toolResults.push({
             type: "tool_result",
             tool_use_id: toolUse.id,
-            content: JSON.stringify({ error: "unknown_tool" })
+            content: JSON.stringify(result)
           });
-          continue;
         }
-        const result = await handler(toolUse.input ?? {});
-        toolResults.push({
-          type: "tool_result",
-          tool_use_id: toolUse.id,
-          content: JSON.stringify(result)
-        });
+
+        nextMessages = [...nextMessages, { role: "user", content: toolResults }];
       }
 
-      nextMessages = [
-        ...nextMessages,
-        {
-          role: "user",
-          content: toolResults
-        }
-      ];
+      return { assistantText, pendingQuotes };
+    };
 
-      if (response.stop_reason !== "tool_use") {
-        assistantText = textBlocks.map((block) => block.text).join("");
-        break;
+    if (!wantsStream) {
+      try {
+        const result = await runChat();
+        return reply.send({
+          assistant: result.assistantText,
+          pending_quotes: result.pendingQuotes
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "console_chat_failed";
+        return reply.status(500).send({ error: message });
       }
     }
 
-    if (!assistantText) assistantText = "I'm ready when you are.";
-    return reply.send({ assistant: assistantText, pending_quotes: pendingQuotes });
+    reply.raw.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive"
+    });
+
+    const sendEvent = (event: string, data: unknown) => {
+      if (reply.raw.writableEnded) return;
+      reply.raw.write(`event: ${event}\n`);
+      reply.raw.write(`data: ${JSON.stringify(data)}\n\n`);
+    };
+
+    sendEvent("status", { state: "thinking" });
+
+    try {
+      const result = await runChat();
+      const text = result.assistantText ?? "";
+      const chunks = text.match(/.{1,24}/g) ?? [];
+      for (const chunk of chunks) {
+        sendEvent("token", { text: chunk });
+        await new Promise((resolve) => setTimeout(resolve, 12));
+      }
+      sendEvent("done", {
+        assistant: text,
+        pending_quotes: result.pendingQuotes
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "console_chat_failed";
+      sendEvent("error", { error: message });
+    }
+    reply.raw.end();
   });
 
-  app.post("/console/actions/transfer/quote", { config: { auth: "console" } }, async (request, reply) => {
-    if (!requireConsoleSession(request, reply)) return;
-    if (!requireScope(request, reply, "propose")) return;
+  app.post("/console/actions/transfer/quote", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     if (env.envName !== "base_usdc") {
       return reply.status(400).send({ error: "env_not_base_usdc" });
     }
-    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
-    const authUser = request.authUser as AuthUser;
     const now = nowSeconds();
     if (!consumeRate(`transfer:quote:${session.sessionId}`, TRANSFER_QUOTE_RATE_MAX, now)) {
       return reply.status(429).send({ error: "rate_limited" });
     }
 
-    const body = (request.body ?? {}) as { amount_cents?: number | string; to_address?: string };
-    const amountCents = parseAmountCents(body.amount_cents);
+    const body2 = (request.body ?? {}) as { amount_cents?: number | string; to_address?: string };
+    const amountCents = parseAmountCents(body2.amount_cents);
     if (!amountCents || amountCents <= 0) {
       return reply.status(400).send({ error: "invalid_amount_cents" });
     }
-    const toAddress = normalizeEvmAddress(body.to_address);
+    const toAddress = normalizeEvmAddress(body2.to_address);
     if (!toAddress) {
       return reply.status(400).send({ error: "invalid_to_address" });
     }
@@ -1099,7 +1168,7 @@ export function buildServer(options: {
     const intent = { type: "usdc_transfer", amount_cents: amountCents, to_address: toAddress };
     const idempotencyKey = newId("idem");
     const quote = await kernel.canDo({
-      user_id: authUser.userId,
+      user_id: session.userId,
       agent_id: session.agentId,
       intent_json: intent,
       idempotency_key: idempotencyKey
@@ -1119,25 +1188,23 @@ export function buildServer(options: {
     });
   });
 
-  app.post("/console/actions/transfer/approve", { config: { auth: "console" } }, async (request, reply) => {
-    if (!requireConsoleSession(request, reply)) return;
-    if (!requireScope(request, reply, "execute")) return;
+  app.post("/console/actions/transfer/approve", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     if (env.envName !== "base_usdc") {
       return reply.status(400).send({ error: "env_not_base_usdc" });
     }
-    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
-    const authUser = request.authUser as AuthUser;
     const now = nowSeconds();
     if (!consumeRate(`transfer:approve:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
       return reply.status(429).send({ error: "rate_limited" });
     }
 
-    const body = (request.body ?? {}) as { quote_id?: string };
-    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const body2 = (request.body ?? {}) as { quote_id?: string };
+    if (!body2.quote_id) return reply.status(400).send({ error: "quote_id_required" });
 
-    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body2.quote_id)).get();
     if (!quote) return reply.status(404).send({ error: "quote_not_found" });
-    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
       return reply.status(403).send({ error: "forbidden" });
     }
     if (quote.expiresAt <= now) {
@@ -1157,7 +1224,7 @@ export function buildServer(options: {
 
     if (quote.requiresStepUp === 1) {
       const challenge = await kernel.requestStepUpChallenge({
-        user_id: authUser.userId,
+        user_id: session.userId,
         agent_id: session.agentId,
         quote_id: quote.quoteId
       });
@@ -1177,7 +1244,7 @@ export function buildServer(options: {
 
     if (result.status === "rejected" && result.reason === "step_up_required") {
       const challenge = await kernel.requestStepUpChallenge({
-        user_id: authUser.userId,
+        user_id: session.userId,
         agent_id: session.agentId,
         quote_id: quote.quoteId
       });
@@ -1217,21 +1284,19 @@ export function buildServer(options: {
     });
   });
 
-  app.post("/console/actions/transfer/cancel", { config: { auth: "console" } }, async (request, reply) => {
-    if (!requireConsoleSession(request, reply)) return;
-    if (!requireScope(request, reply, "execute")) return;
-    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
-    const authUser = request.authUser as AuthUser;
+  app.post("/console/actions/transfer/cancel", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     const now = nowSeconds();
     if (!consumeRate(`transfer:cancel:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
       return reply.status(429).send({ error: "rate_limited" });
     }
 
-    const body = (request.body ?? {}) as { quote_id?: string };
-    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
-    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    const body2 = (request.body ?? {}) as { quote_id?: string };
+    if (!body2.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body2.quote_id)).get();
     if (!quote) return reply.status(404).send({ error: "quote_not_found" });
-    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
       return reply.status(403).send({ error: "forbidden" });
     }
 
@@ -1262,37 +1327,35 @@ export function buildServer(options: {
     return reply.send({ status: "cancelled" });
   });
 
-  app.post("/console/actions/step_up/confirm", { config: { auth: "console" } }, async (request, reply) => {
-    if (!requireConsoleSession(request, reply)) return;
-    if (!requireScope(request, reply, "execute")) return;
+  app.post("/console/actions/step_up/confirm", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     if (env.envName !== "base_usdc") {
       return reply.status(400).send({ error: "env_not_base_usdc" });
     }
-    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
-    const authUser = request.authUser as AuthUser;
     const now = nowSeconds();
     if (!consumeRate(`transfer:step_up:${session.sessionId}`, TRANSFER_STEP_UP_RATE_MAX, now)) {
       return reply.status(429).send({ error: "rate_limited" });
     }
 
-    const body = (request.body ?? {}) as { step_up_id?: string; code?: string };
-    if (!body.step_up_id || !body.code) {
+    const body2 = (request.body ?? {}) as { step_up_id?: string; code?: string };
+    if (!body2.step_up_id || !body2.code) {
       return reply.status(400).send({ error: "step_up_id_and_code_required" });
     }
 
     const challenge = db
       .select()
       .from(stepUpChallenges)
-      .where(eq(stepUpChallenges.id, body.step_up_id))
+      .where(eq(stepUpChallenges.id, body2.step_up_id))
       .get();
     if (!challenge) return reply.status(404).send({ error: "challenge_not_found" });
-    if (challenge.agentId !== session.agentId || challenge.userId !== authUser.userId) {
+    if (challenge.agentId !== session.agentId || challenge.userId !== session.userId) {
       return reply.status(403).send({ error: "forbidden" });
     }
 
     const confirmation = await kernel.confirmStepUpChallenge({
-      challenge_id: body.step_up_id,
-      code: body.code,
+      challenge_id: body2.step_up_id,
+      code: body2.code,
       decision: "approve"
     });
     if (!confirmation.ok) {
@@ -1301,7 +1364,7 @@ export function buildServer(options: {
 
     const quote = db.select().from(quotes).where(eq(quotes.quoteId, challenge.quoteId)).get();
     if (!quote) return reply.status(404).send({ error: "quote_not_found" });
-    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+    if (quote.userId !== session.userId || quote.agentId !== session.agentId) {
       return reply.status(403).send({ error: "forbidden" });
     }
     if (quote.expiresAt <= nowSeconds()) {
@@ -1341,7 +1404,9 @@ export function buildServer(options: {
     });
   });
 
-  app.post("/console/execute", { config: { auth: "console" } }, async (request, reply) => {
+  app.post("/console/execute", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     const body = request.body as {
       quote_id?: string;
       idempotency_key?: string;
@@ -1350,15 +1415,6 @@ export function buildServer(options: {
     };
     if (!body.quote_id || !body.idempotency_key) {
       return reply.status(400).send({ error: "quote_id_and_idempotency_key_required" });
-    }
-    if (!requireScope(request, reply, "execute")) return;
-    const authUser = request.authUser as AuthUser;
-    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
-    if (quote && quote.userId !== authUser.userId) {
-      return reply.status(403).send({ error: "forbidden" });
-    }
-    if (quote && request.consoleSession && quote.agentId !== request.consoleSession.agentId) {
-      return reply.status(403).send({ error: "console_session_agent_mismatch" });
     }
     const result = await kernel.execute({
       quote_id: body.quote_id,
@@ -1369,59 +1425,40 @@ export function buildServer(options: {
     return reply.send(result);
   });
 
-  app.post("/console/step_up/request", { config: { auth: "console" } }, async (request, reply) => {
-    const body = request.body as { agent_id?: string; quote_id?: string };
-    if (!body.agent_id || !body.quote_id) return reply.status(400).send({ error: "agent_id_and_quote_id_required" });
-    if (!requireScope(request, reply, "owner")) return;
-    if (!ensureConsoleAgentMatch(request, reply, body.agent_id)) return;
-    const authUser = request.authUser as AuthUser;
-    const ownership = ensureAgentOwnership(db, body.agent_id, authUser.userId);
-    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
+  app.post("/console/step_up/request", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body = request.body as { quote_id?: string };
+    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
     const challenge = await kernel.requestStepUpChallenge({
-      user_id: authUser.userId,
-      agent_id: body.agent_id,
+      user_id: session.userId,
+      agent_id: session.agentId,
       quote_id: body.quote_id
     });
     return reply.send(challenge);
   });
 
-  app.post("/console/step_up/confirm", { config: { auth: "console" } }, async (request, reply) => {
+  app.post("/console/step_up/confirm", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
     const body = request.body as { challenge_id?: string; code?: string; decision?: "approve" | "deny" };
     if (!body.challenge_id || !body.code || !body.decision) {
       return reply.status(400).send({ error: "challenge_id_code_decision_required" });
-    }
-    if (!requireScope(request, reply, "owner")) return;
-    if (request.consoleSession) {
-      const challenge = db
-        .select()
-        .from(stepUpChallenges)
-        .where(eq(stepUpChallenges.id, body.challenge_id))
-        .get();
-      if (challenge && challenge.agentId !== request.consoleSession.agentId) {
-        return reply.status(403).send({ error: "console_session_agent_mismatch" });
-      }
     }
     const result = await kernel.confirmStepUpChallenge({
       challenge_id: body.challenge_id,
       code: body.code,
       decision: body.decision
     });
-    if (result.ok === false) {
-      const error = "reason" in result ? result.reason : "unknown_error";
-      return reply.status(400).send({ error });
-    }
+    if (!result.ok) return reply.status(400).send({ error: result.reason });
     return reply.send(result.response);
   });
 
-  app.post("/console/freeze", { config: { auth: "console" } }, async (request, reply) => {
-    const body = request.body as { agent_id?: string; reason?: string };
-    if (!body.agent_id) return reply.status(400).send({ error: "agent_id_required" });
-    if (!requireScope(request, reply, "owner")) return;
-    if (!ensureConsoleAgentMatch(request, reply, body.agent_id)) return;
-    const authUser = request.authUser as AuthUser;
-    const ownership = ensureAgentOwnership(db, body.agent_id, authUser.userId);
-    if (!ownership.ok) return reply.status(ownership.statusCode).send({ error: ownership.error });
-    const result = kernel.freezeAgent(body.agent_id, body.reason ?? "console_freeze");
+  app.post("/console/freeze", { config: { auth: "public" } }, async (request, reply) => {
+    const session = requireConsoleSession(request, reply);
+    if (!session) return;
+    const body2 = request.body as { reason?: string };
+    const result = kernel.freezeAgent(session.agentId, body2.reason ?? "console_freeze");
     return reply.send(result);
   });
 
@@ -1455,6 +1492,7 @@ export function buildServer(options: {
       available: spend.effective_spend_power_cents ?? null
     });
   });
+
 
   app.post("/api/card/auth", { config: { auth: "public" } }, async (request, reply) => {
     const body = request.body as {

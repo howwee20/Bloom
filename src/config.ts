@@ -32,6 +32,8 @@ export type Config = {
   ANTHROPIC_API_KEY: string | null;
   ANTHROPIC_MODEL: string;
   CONSOLE_BOOTSTRAP_TOKEN: string | null;
+  CONSOLE_PASSWORD: string | null;
+  CONSOLE_SESSION_TTL_SECONDS: number;
 };
 
 function isRunningInDocker() {
@@ -111,6 +113,10 @@ export function getConfig(): Config {
     // Console (reference client)
     ANTHROPIC_API_KEY: env.ANTHROPIC_API_KEY ?? null,
     ANTHROPIC_MODEL: env.ANTHROPIC_MODEL ?? "claude-3-5-sonnet-20240620",
-    CONSOLE_BOOTSTRAP_TOKEN: env.CONSOLE_BOOTSTRAP_TOKEN ?? null
+    CONSOLE_BOOTSTRAP_TOKEN: env.CONSOLE_BOOTSTRAP_TOKEN ?? null,
+    CONSOLE_PASSWORD: env.CONSOLE_PASSWORD ?? null,
+    CONSOLE_SESSION_TTL_SECONDS: env.CONSOLE_SESSION_TTL_SECONDS
+      ? Number(env.CONSOLE_SESSION_TTL_SECONDS)
+      : 12 * 60 * 60
   };
 }

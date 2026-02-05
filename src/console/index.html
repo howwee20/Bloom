@@ -7,128 +7,124 @@
     <link rel="stylesheet" href="/console/styles.css" />
   </head>
   <body>
-    <div class="app">
-      <header class="header">
-        <div class="header__left">
-          <div class="wordmark">Bloom</div>
-          <div class="availability">
-            <span class="availability__label">Available</span>
-            <span class="availability__value" id="availableValue">$0.00</span>
-          </div>
-          <div class="availability__updated" id="updatedLabel">Updated just now</div>
+    <div class="console">
+      <header class="console__header">
+        <div>
+          <p class="console__eyebrow">Bloom Console</p>
+          <h1>Banking you can talk to.</h1>
+          <p class="console__subhead">Reference client for the Bloom Kernel. Ask. Verify. Approve. Execute. Receipt.</p>
         </div>
-        <div class="header__right">
-          <a
-            class="header__link"
-            href="https://github.com/howwee20/Bloom"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Open-source Kernel
-          </a>
-          <span class="status" id="statusBadge">Disconnected</span>
-          <button class="btn btn--ghost" id="detailsToggle" type="button">Details</button>
-        </div>
+        <div class="status" id="statusBadge">Disconnected</div>
       </header>
 
-      <main class="chat-layout">
-        <div class="chat-column">
-          <div class="chat-thread" id="chatMessages"></div>
+      <section class="card" id="sessionPanel">
+        <div class="card__header">
+          <h2>Unlock Console</h2>
+          <p>Local session auth. No API keys in your browser.</p>
+        </div>
+        <div class="grid">
+          <label class="field">
+            <span>Console password</span>
+            <input
+              id="passwordInput"
+              type="password"
+              placeholder="Set CONSOLE_PASSWORD or leave blank on localhost"
+              autocomplete="current-password"
+            />
+          </label>
+          <label class="field" id="bootstrapTokenWrap" hidden>
+            <span>Bootstrap code</span>
+            <input id="bootstrapTokenInput" placeholder="Operator-provided code" autocomplete="off" />
+          </label>
+        </div>
+        <div class="actions">
+          <button class="btn btn--primary" id="loginButton">Enter Console</button>
+        </div>
+        <p class="error" id="sessionError"></p>
+        <p class="hint" id="sessionHint">
+          First run creates a single Bloom account. Set <code>CONSOLE_BOOTSTRAP_TOKEN</code> to require a code.
+        </p>
+      </section>
 
-          <div class="chat-empty" id="emptyState">
-            <div class="empty-card" id="connectPanel">
-              <h2>Enter Bloom Console</h2>
-              <p>Use your existing Bloom to start chatting.</p>
-              <div class="empty-actions">
-                <button class="btn btn--primary" id="connectButton" type="button">Import existing Bloom</button>
-              </div>
-              <div class="field" id="bootstrapTokenWrap" hidden>
-                <label for="bootstrapTokenInput">Bootstrap code</label>
-                <input id="bootstrapTokenInput" placeholder="Ask the operator" autocomplete="off" />
-              </div>
-              <p class="error" id="sessionError"></p>
+      <section class="console__main" id="consoleMain" hidden>
+        <div class="console__grid">
+          <div class="chat card">
+            <div class="card__header">
+              <h2>Talk to Bloom</h2>
+              <p>Ask about balance or propose a transfer. Bloom will ask for approval before execution.</p>
             </div>
-            <div class="empty-suggestions" id="suggestions">
-              <p class="empty-label">Try asking:</p>
-              <div class="suggestion-list">
-                <button class="suggestion" data-suggestion="How much do I have?" type="button">How much do I have?</button>
-                <button class="suggestion" data-suggestion="Set aside $200 for rent Friday." type="button">Set aside $200 for rent Friday.</button>
-                <button class="suggestion" data-suggestion="Can I spend $50 today?" type="button">Can I spend $50 today?</button>
+            <div class="chat__messages" id="chatMessages"></div>
+            <form class="chat__composer" id="chatForm">
+              <input id="chatInput" placeholder="Ask: &ldquo;How much do I have?&rdquo;" autocomplete="off" />
+              <button class="btn btn--danger" id="stopButton" type="button">Stop</button>
+              <button class="btn btn--primary" id="sendButton" type="submit">Send</button>
+            </form>
+            <div class="chat__pending">
+              <div class="pending__header">
+                <h3>Approvals</h3>
+                <p>Bloom never executes without your explicit approval.</p>
               </div>
+              <div id="pendingQuotes"></div>
+            </div>
+          </div>
+
+          <div class="sidebar">
+            <div class="card">
+              <div class="card__header card__header--row">
+                <div>
+                  <h2>Account</h2>
+                  <p id="accountMeta">Waiting for connection...</p>
+                </div>
+                <button class="btn btn--ghost btn--small" id="logoutButton" type="button">Sign out</button>
+              </div>
+              <div class="stat">
+                <span>Available</span>
+                <strong id="availableValue">&mdash;</strong>
+              </div>
+              <div class="stat">
+                <span>Confirmed</span>
+                <strong id="confirmedValue">&mdash;</strong>
+              </div>
+              <div class="stat">
+                <span>Reserved</span>
+                <strong id="reservedValue">&mdash;</strong>
+              </div>
+              <div class="divider"></div>
+              <div class="field">
+                <span>Address</span>
+                <div class="inline">
+                  <input id="walletAddress" readonly value="&mdash;" />
+                  <button class="btn btn--ghost" id="copyAddress" type="button">Copy</button>
+                </div>
+              </div>
+              <p class="hint" id="fundingHint">Add funds by sending USDC to this address.</p>
+              <button class="btn btn--danger-outline" id="freezeButton" type="button">Freeze Account</button>
+            </div>
+
+            <div class="card">
+              <div class="card__header">
+                <h2>Receipts</h2>
+                <p>Every action is recorded. This is the source of truth.</p>
+              </div>
+              <div class="receipt" id="receiptsList"></div>
             </div>
           </div>
         </div>
-      </main>
-
-      <footer class="footer">
-        <a
-          class="footer__link"
-          href="https://github.com/howwee20/Bloom"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          Kernel (GitHub)
-        </a>
-      </footer>
-
-      <div class="composer-bar">
-        <form class="composer" id="chatForm">
-          <textarea id="chatInput" rows="1" placeholder="Message Bloom" autocomplete="off"></textarea>
-          <div class="composer__actions">
-            <button class="btn btn--ghost" id="stopButton" type="button" hidden>Stop</button>
-            <button class="btn btn--primary" id="sendButton" type="submit">Send</button>
-          </div>
-        </form>
-      </div>
+      </section>
     </div>
 
-    <div class="overlay" id="detailsOverlay" hidden></div>
-    <aside class="details" id="detailsDrawer" aria-hidden="true">
-      <div class="details__header">
-        <h2>Details</h2>
-        <button class="btn btn--ghost" id="detailsClose" type="button">Close</button>
+    <div class="modal" id="stepUpModal" hidden>
+      <div class="modal__content">
+        <h3>Approve Spend</h3>
+        <p>Step-up required. Use the code below to approve this spend.</p>
+        <div class="step-up__code" id="stepUpCode">&mdash;</div>
+        <div class="actions">
+          <button class="btn" id="stepUpCancel">Cancel</button>
+          <button class="btn btn--primary" id="stepUpApprove">Approve</button>
+        </div>
+        <p class="hint" id="stepUpStatus"></p>
       </div>
-
-      <section class="details__section">
-        <h3>Address</h3>
-        <div class="wallet-row">
-          <input id="walletAddress" readonly value="" />
-          <button class="btn btn--ghost" id="copyAddress" type="button">Copy</button>
-        </div>
-        <p class="helper">Send USDC to this address.</p>
-      </section>
-
-      <section class="details__section">
-        <h3>Record</h3>
-        <div class="record" id="recordList"></div>
-      </section>
-
-      <section class="details__section">
-        <h3>Lock</h3>
-        <button class="btn btn--danger" id="lockButton" type="button">Lock</button>
-        <p class="helper">Stops spending immediately.</p>
-      </section>
-
-      <section class="details__section details__section--advanced">
-        <h3>Advanced</h3>
-        <div class="advanced-block">
-          <p>Bootstrap code</p>
-          <input id="bootstrapTokenInputDetails" placeholder="Ask the operator" autocomplete="off" />
-        </div>
-        <div class="advanced-block">
-          <p>Create new Bloom (advanced)</p>
-          <input id="createConfirmInput" placeholder="Type CREATE to confirm" autocomplete="off" />
-          <button class="btn btn--primary" id="createButton" type="button">Create new Bloom (advanced)</button>
-        </div>
-        <div class="advanced-block">
-          <p>Use API key</p>
-          <input id="apiKeyInput" placeholder="bloom_sk_..." autocomplete="off" />
-          <input id="agentIdInput" placeholder="agent_..." autocomplete="off" />
-          <button class="btn btn--ghost" id="importButton" type="button">Use API key</button>
-        </div>
-        <p class="error" id="advancedError"></p>
-      </section>
-    </aside>
+    </div>
 
     <script src="/console/app.js"></script>
   </body>
