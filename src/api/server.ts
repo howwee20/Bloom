@@ -11,6 +11,7 @@ import { Kernel } from "../kernel/kernel.js";
 import { SimpleEconomyWorld } from "../env/simple_economy.js";
 import { BaseUsdcWorld } from "../env/base_usdc.js";
 import { buildUiActivity, formatMoney, shortenAddress } from "../presentation/index.js";
+import { getAddress } from "viem";
 import {
   agentSpendSnapshot,
   agentTokens,
@@ -22,6 +23,8 @@ import {
   policies,
   quotes,
   receipts,
+  baseUsdcActionDedup,
+  baseUsdcPendingTxs,
   stepUpChallenges,
   users
 } from "../db/schema.js";
@@ -299,6 +302,45 @@ function summarizeIntent(intent: Record<string, unknown>) {
   return `Intent: ${type || "unknown"}`;
 }
 
+function requireConsoleSession(request: FastifyRequest, reply: FastifyReply) {
+  if (request.consoleSession) return true;
+  reply.status(401).send({ error: "console_session_required" });
+  return false;
+}
+
+function parseAmountCents(value: unknown) {
+  const numeric = typeof value === "string" ? Number(value) : Number(value);
+  if (!Number.isFinite(numeric) || !Number.isInteger(numeric)) return null;
+  return numeric;
+}
+
+function normalizeEvmAddress(value: unknown) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  if (!/^0x[a-fA-F0-9]{40}$/.test(raw)) return null;
+  try {
+    return getAddress(raw);
+  } catch {
+    return null;
+  }
+}
+
+function extractUsdcTransferDetails(intent: Record<string, unknown>) {
+  if (String(intent.type ?? "") !== "usdc_transfer") return null;
+  const amount = Number(intent.amount_cents ?? 0);
+  const toAddress = String(intent.to_address ?? "");
+  return {
+    intent_type: "usdc_transfer",
+    amount_cents: Number.isFinite(amount) ? amount : null,
+    to_address: toAddress || null
+  };
+}
+
+function looksLikeTxHash(value: string | null | undefined) {
+  if (!value) return false;
+  return /^0x[a-fA-F0-9]{64}$/.test(value);
+}
+
 type CardAuthResponse = {
   approved: boolean;
   shadow: boolean;
@@ -441,6 +483,9 @@ export function buildServer(options: {
   const RATE_LIMIT_WINDOW_SECONDS = 60;
   const RATE_LIMIT_MAX_PER_KEY = 60;
   const RATE_LIMIT_MAX_PER_IP = 120;
+  const TRANSFER_QUOTE_RATE_MAX = 12;
+  const TRANSFER_APPROVE_RATE_MAX = 6;
+  const TRANSFER_STEP_UP_RATE_MAX = 6;
 
   app.get("/healthz", { config: { auth: "public" } }, async (_request, reply) => {
     let dbConnected = false;
@@ -470,6 +515,34 @@ export function buildServer(options: {
     if (existing.count >= max) return false;
     existing.count += 1;
     return true;
+  }
+
+  function resolveTransferTxHash(input: {
+    agentId: string;
+    quoteId: string;
+    idempotencyKey: string;
+    fallback?: string;
+  }) {
+    const pending = db
+      .select()
+      .from(baseUsdcPendingTxs)
+      .where(and(eq(baseUsdcPendingTxs.agentId, input.agentId), eq(baseUsdcPendingTxs.quoteId, input.quoteId)))
+      .orderBy(desc(baseUsdcPendingTxs.createdAt))
+      .get() as typeof baseUsdcPendingTxs.$inferSelect | undefined;
+    if (pending?.txHash) return pending.txHash;
+    const dedup = db
+      .select()
+      .from(baseUsdcActionDedup)
+      .where(
+        and(
+          eq(baseUsdcActionDedup.agentId, input.agentId),
+          eq(baseUsdcActionDedup.idempotencyKey, input.idempotencyKey)
+        )
+      )
+      .get() as typeof baseUsdcActionDedup.$inferSelect | undefined;
+    if (dedup?.txHash) return dedup.txHash;
+    if (looksLikeTxHash(input.fallback)) return input.fallback as string;
+    return null;
   }
 
   app.addHook("preHandler", async (request, reply) => {
@@ -864,7 +937,7 @@ export function buildServer(options: {
     const tools = [
       {
         name: "kernel_state",
-        description: "Get current spend power and wallet state for the agent.",
+        description: "Get current spend power and address state for the agent.",
         input_schema: { type: "object", properties: {} }
       },
       {
@@ -893,6 +966,9 @@ export function buildServer(options: {
       expires_at: number;
       idempotency_key: string;
       summary: string;
+      intent_type?: string | null;
+      amount_cents?: number | null;
+      to_address?: string | null;
     }> = [];
 
     const toolHandlers = {
@@ -911,6 +987,7 @@ export function buildServer(options: {
           intent_json: intent,
           idempotency_key: idempotencyKey
         });
+        const transferDetails = extractUsdcTransferDetails(intent);
         pendingQuotes.push({
           quote_id: quote.quote_id,
           allowed: quote.allowed,
@@ -918,7 +995,10 @@ export function buildServer(options: {
           reason: quote.reason,
           expires_at: quote.expires_at,
           idempotency_key: quote.idempotency_key,
-          summary: summarizeIntent(intent)
+          summary: summarizeIntent(intent),
+          intent_type: transferDetails?.intent_type ?? null,
+          amount_cents: transferDetails?.amount_cents ?? null,
+          to_address: transferDetails?.to_address ?? null
         });
         return {
           quote_id: quote.quote_id,
@@ -991,6 +1071,274 @@ export function buildServer(options: {
 
     if (!assistantText) assistantText = "I'm ready when you are.";
     return reply.send({ assistant: assistantText, pending_quotes: pendingQuotes });
+  });
+
+  app.post("/console/actions/transfer/quote", { config: { auth: "console" } }, async (request, reply) => {
+    if (!requireConsoleSession(request, reply)) return;
+    if (!requireScope(request, reply, "propose")) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
+    const authUser = request.authUser as AuthUser;
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:quote:${session.sessionId}`, TRANSFER_QUOTE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body = (request.body ?? {}) as { amount_cents?: number | string; to_address?: string };
+    const amountCents = parseAmountCents(body.amount_cents);
+    if (!amountCents || amountCents <= 0) {
+      return reply.status(400).send({ error: "invalid_amount_cents" });
+    }
+    const toAddress = normalizeEvmAddress(body.to_address);
+    if (!toAddress) {
+      return reply.status(400).send({ error: "invalid_to_address" });
+    }
+
+    const intent = { type: "usdc_transfer", amount_cents: amountCents, to_address: toAddress };
+    const idempotencyKey = newId("idem");
+    const quote = await kernel.canDo({
+      user_id: authUser.userId,
+      agent_id: session.agentId,
+      intent_json: intent,
+      idempotency_key: idempotencyKey
+    });
+
+    return reply.send({
+      quote_id: quote.quote_id,
+      allowed: quote.allowed,
+      requires_step_up: quote.requires_step_up,
+      reason: quote.reason,
+      expires_at: quote.expires_at,
+      idempotency_key: quote.idempotency_key,
+      summary: summarizeIntent(intent),
+      intent_type: "usdc_transfer",
+      amount_cents: amountCents,
+      to_address: toAddress
+    });
+  });
+
+  app.post("/console/actions/transfer/approve", { config: { auth: "console" } }, async (request, reply) => {
+    if (!requireConsoleSession(request, reply)) return;
+    if (!requireScope(request, reply, "execute")) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
+    const authUser = request.authUser as AuthUser;
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:approve:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body = (request.body ?? {}) as { quote_id?: string };
+    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    if (quote.expiresAt <= now) {
+      return reply.status(400).send({ error: "quote_expired" });
+    }
+    if (quote.allowed !== 1) {
+      return reply.status(400).send({ error: "quote_not_allowed" });
+    }
+    const cancelled = db
+      .select()
+      .from(receipts)
+      .where(and(eq(receipts.externalRef, quote.quoteId), eq(receipts.whatHappened, "Quote cancelled by user.")))
+      .get();
+    if (cancelled) {
+      return reply.status(400).send({ error: "quote_cancelled" });
+    }
+
+    if (quote.requiresStepUp === 1) {
+      const challenge = await kernel.requestStepUpChallenge({
+        user_id: authUser.userId,
+        agent_id: session.agentId,
+        quote_id: quote.quoteId
+      });
+      return reply.send({
+        status: "step_up_required",
+        step_up_id: challenge.challenge_id,
+        expires_at: challenge.expires_at,
+        prompt: "Enter the code",
+        code: challenge.code
+      });
+    }
+
+    const result = await kernel.execute({
+      quote_id: quote.quoteId,
+      idempotency_key: quote.idempotencyKey
+    });
+
+    if (result.status === "rejected" && result.reason === "step_up_required") {
+      const challenge = await kernel.requestStepUpChallenge({
+        user_id: authUser.userId,
+        agent_id: session.agentId,
+        quote_id: quote.quoteId
+      });
+      return reply.send({
+        status: "step_up_required",
+        step_up_id: challenge.challenge_id,
+        expires_at: challenge.expires_at,
+        prompt: "Enter the code",
+        code: challenge.code
+      });
+    }
+    if (result.status === "rejected") {
+      return reply.status(400).send({ error: result.reason ?? "execution_rejected" });
+    }
+    if (result.status === "failed") {
+      return reply.status(400).send({ error: result.reason ?? "execution_failed" });
+    }
+
+    const intent = parseJson<Record<string, unknown>>(quote.intentJson, {});
+    const details = extractUsdcTransferDetails(intent);
+    const txHash = resolveTransferTxHash({
+      agentId: quote.agentId,
+      quoteId: quote.quoteId,
+      idempotencyKey: quote.idempotencyKey,
+      fallback: result.external_ref
+    });
+    const recordId = txHash ?? quote.quoteId;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[transfer] amount_cents=${details?.amount_cents ?? "unknown"} to_address=${details?.to_address ?? "unknown"} tx_hash=${txHash ?? "unknown"} record_id=${recordId}`
+    );
+
+    return reply.send({
+      status: "executed",
+      tx_hash: txHash,
+      record_id: recordId
+    });
+  });
+
+  app.post("/console/actions/transfer/cancel", { config: { auth: "console" } }, async (request, reply) => {
+    if (!requireConsoleSession(request, reply)) return;
+    if (!requireScope(request, reply, "execute")) return;
+    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
+    const authUser = request.authUser as AuthUser;
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:cancel:${session.sessionId}`, TRANSFER_APPROVE_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body = (request.body ?? {}) as { quote_id?: string };
+    if (!body.quote_id) return reply.status(400).send({ error: "quote_id_required" });
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, body.quote_id)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+
+    const existing = db
+      .select()
+      .from(receipts)
+      .where(and(eq(receipts.externalRef, quote.quoteId), eq(receipts.whatHappened, "Quote cancelled by user.")))
+      .get();
+    if (!existing) {
+      const event = appendEvent(db, sqlite, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        type: "quote_cancelled",
+        payload: { quote_id: quote.quoteId }
+      });
+      createReceipt(db, {
+        agentId: quote.agentId,
+        userId: quote.userId,
+        source: "policy",
+        eventId: event.event_id,
+        externalRef: quote.quoteId,
+        whatHappened: "Quote cancelled by user.",
+        whyChanged: "cancelled",
+        whatHappensNext: "Request a new quote."
+      });
+    }
+
+    return reply.send({ status: "cancelled" });
+  });
+
+  app.post("/console/actions/step_up/confirm", { config: { auth: "console" } }, async (request, reply) => {
+    if (!requireConsoleSession(request, reply)) return;
+    if (!requireScope(request, reply, "execute")) return;
+    if (env.envName !== "base_usdc") {
+      return reply.status(400).send({ error: "env_not_base_usdc" });
+    }
+    const session = request.consoleSession as { sessionId: string; userId: string; agentId: string };
+    const authUser = request.authUser as AuthUser;
+    const now = nowSeconds();
+    if (!consumeRate(`transfer:step_up:${session.sessionId}`, TRANSFER_STEP_UP_RATE_MAX, now)) {
+      return reply.status(429).send({ error: "rate_limited" });
+    }
+
+    const body = (request.body ?? {}) as { step_up_id?: string; code?: string };
+    if (!body.step_up_id || !body.code) {
+      return reply.status(400).send({ error: "step_up_id_and_code_required" });
+    }
+
+    const challenge = db
+      .select()
+      .from(stepUpChallenges)
+      .where(eq(stepUpChallenges.id, body.step_up_id))
+      .get();
+    if (!challenge) return reply.status(404).send({ error: "challenge_not_found" });
+    if (challenge.agentId !== session.agentId || challenge.userId !== authUser.userId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+
+    const confirmation = await kernel.confirmStepUpChallenge({
+      challenge_id: body.step_up_id,
+      code: body.code,
+      decision: "approve"
+    });
+    if (!confirmation.ok) {
+      return reply.status(400).send({ error: confirmation.reason ?? "step_up_failed" });
+    }
+
+    const quote = db.select().from(quotes).where(eq(quotes.quoteId, challenge.quoteId)).get();
+    if (!quote) return reply.status(404).send({ error: "quote_not_found" });
+    if (quote.userId !== authUser.userId || quote.agentId !== session.agentId) {
+      return reply.status(403).send({ error: "forbidden" });
+    }
+    if (quote.expiresAt <= nowSeconds()) {
+      return reply.status(400).send({ error: "quote_expired" });
+    }
+
+    const result = await kernel.execute({
+      quote_id: quote.quoteId,
+      idempotency_key: quote.idempotencyKey,
+      step_up_token: confirmation.response.step_up_token
+    });
+    if (result.status === "rejected") {
+      return reply.status(400).send({ error: result.reason ?? "execution_rejected" });
+    }
+    if (result.status === "failed") {
+      return reply.status(400).send({ error: result.reason ?? "execution_failed" });
+    }
+
+    const intent = parseJson<Record<string, unknown>>(quote.intentJson, {});
+    const details = extractUsdcTransferDetails(intent);
+    const txHash = resolveTransferTxHash({
+      agentId: quote.agentId,
+      quoteId: quote.quoteId,
+      idempotencyKey: quote.idempotencyKey,
+      fallback: result.external_ref
+    });
+    const recordId = txHash ?? quote.quoteId;
+    // eslint-disable-next-line no-console
+    console.log(
+      `[transfer] amount_cents=${details?.amount_cents ?? "unknown"} to_address=${details?.to_address ?? "unknown"} tx_hash=${txHash ?? "unknown"} record_id=${recordId}`
+    );
+
+    return reply.send({
+      status: "executed",
+      tx_hash: txHash,
+      record_id: recordId
+    });
   });
 
   app.post("/console/execute", { config: { auth: "console" } }, async (request, reply) => {
