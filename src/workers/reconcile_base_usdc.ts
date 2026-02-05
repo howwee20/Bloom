@@ -1,3 +1,4 @@
+import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
 import { createPublicClient, http } from "viem";
@@ -168,8 +169,8 @@ export async function reconcileBaseUsdcPendingTxs(input: {
       });
 
       const whatHappened = isSuccess
-        ? `USDC transfer confirmed on-chain. tx_hash=${row.txHash} confirmed_block_number=${confirmedBlockNumber} confirmations=${confirmations}`
-        : `USDC transfer reverted on-chain. tx_hash=${row.txHash} confirmed_block_number=${confirmedBlockNumber} confirmations=${confirmations}`;
+        ? `USDC transfer confirmed on network. tx_hash=${row.txHash} confirmed_block_number=${confirmedBlockNumber} confirmations=${confirmations}`
+        : `USDC transfer reverted on network. tx_hash=${row.txHash} confirmed_block_number=${confirmedBlockNumber} confirmations=${confirmations}`;
       createReceipt(input.db, {
         agentId: row.agentId,
         userId: agentRow.userId,

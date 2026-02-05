@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { createDatabase } from "../db/database.js";
 import { getConfig } from "../config.js";
 import { receipts } from "../db/schema.js";
